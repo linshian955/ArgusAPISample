@@ -54,6 +54,7 @@ enum maxCamDevice
 };
 using namespace Argus;
 using namespace EGLStream;
+#define FILE_DIR "/home/asus/Desktop/result/"
 namespace ArgusSamples
 {
 
@@ -215,13 +216,13 @@ bool StereoDisparityConsumerThread::threadExecute()
     CONSUMER_PRINT("Waiting for Argus producer to connect to right stream.\n");
     m_rightStream->waitUntilConnected();
     */
-    IEGLOutputStream *iLeftStream = m_leftStream;
+    //IEGLOutputStream *iLeftStream = m_leftStream;
     IFrameConsumer* iFrameConsumerLeft = interface_cast<IFrameConsumer>(m_leftConsumer);
 
     IFrameConsumer* iFrameConsumerRight = NULL;
     if (m_rightStream)
     {
-        IEGLOutputStream *iRightStream = m_rightStream;
+        //IEGLOutputStream *iRightStream = interface_cast<IEGLOutputStream>(m_rightStream);
         iFrameConsumerRight = interface_cast<IFrameConsumer>(m_rightConsumer);
         if (!iFrameConsumerRight)
         {
@@ -230,7 +231,7 @@ bool StereoDisparityConsumerThread::threadExecute()
         // Wait until the producer has connected to the stream.
         CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to right stream...\n",
             "right");
-        if (iRightStream->waitUntilConnected() != STATUS_OK)
+        if (m_rightStream->waitUntilConnected() != STATUS_OK)
             ORIGINATE_ERROR("Argus producer failed to connect to right stream.");
         CONSUMER_PRINT("[%s]: Argus producer for right stream has connected; continuing.\n",
             "right");
@@ -239,7 +240,7 @@ bool StereoDisparityConsumerThread::threadExecute()
     // Wait until the producer has connected to the stream.
     CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to left stream...\n",
         "right");
-    if (iLeftStream->waitUntilConnected() != STATUS_OK)
+    if (m_leftStream->waitUntilConnected() != STATUS_OK)
         ORIGINATE_ERROR("[%s]Argus producer failed to connect to left stream.\n", "left");
     CONSUMER_PRINT("[%s]: Argus producer for left stream has connected; continuing.\n",
         "left");
@@ -259,7 +260,7 @@ bool StereoDisparityConsumerThread::threadExecute()
     bool rightDrop = false;
     asyncCount = 0;
     syncCount = 0;
-    
+    char filepath[80];    
     CONSUMER_PRINT("Streams connected, processing frames.\n");
     /*unsigned int histogramLeft[HISTOGRAM_BINS];
     unsigned int histogramRight[HISTOGRAM_BINS];
@@ -345,6 +346,24 @@ bool StereoDisparityConsumerThread::threadExecute()
 
             tscTimeStampLeftNew = iSensorTimestampTscLeft->getSensorSofTimestampTsc();
             frameNumberLeft = iFrameLeft->getNumber();
+	    EGLStream::Image *image = iFrameLeft->getImage();
+	    if(!image)
+	    {
+                ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
+            }
+		EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image);
+	    if(!iImageJPEG)
+	    {
+	        ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
+            }
+
+	    sprintf(filepath,FILE_DIR "Left_FrameNum%llu_Diff%.2f_timestamp%llu.jpg",frameNumberLeft,(tscTimeStampLeftNew-tscTimeStampRight)/1000000.0f,tscTimeStampLeftNew);
+            Argus::Status status = iImageJPEG->writeJPEG(filepath);
+            if(status != Argus::STATUS_OK)
+            {
+                ORIGINATE_ERROR("Failed to write JPEG");
+            }
+	    printf("Wrote file: %s",filepath);
         }
 
         if (m_rightStream && ((diff/1000.0f < SYNC_THRESHOLD_TIME_US) || rightDrop))
@@ -378,14 +397,25 @@ bool StereoDisparityConsumerThread::threadExecute()
 
             tscTimeStampRightNew = iSensorTimestampTscRight->getSensorSofTimestampTsc2();
             frameNumberRight = iFrameRight->getNumber();
-	
+	    EGLStream::Image *image = iFrameRight->getImage();
+	    if(!image)
+	    {
+                ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
+            }
+		EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image);
+	    if(!iImageJPEG)
+	    {
+	        ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
+            }
+
+	    sprintf(filepath,FILE_DIR "Right_FrameNum%llu_Diff%.2f_timestamp%llu.jpg",frameNumberLeft,(tscTimeStampLeftNew-tscTimeStampRight)/1000000.0f,tscTimeStampLeftNew);
+            Argus::Status status = iImageJPEG->writeJPEG(filepath);
+            if(status != Argus::STATUS_OK)
+            {
+                ORIGINATE_ERROR("Failed to write JPEG");
+            }
+	    printf("Wrote file: %s",filepath);
         }
- CONSUMER_PRINT("[%s]: left and right diff tsc timestamps (us): { %llu %llu } frame diff{ %llu %llu }, difference (us): %f and frame number: { %llu %llu }\n",
-            "right",
-            tscTimeStampLeft/1000, tscTimeStampRight/1000,
-            (tscTimeStampLeftNew - tscTimeStampLeft)/1000, (tscTimeStampRightNew -tscTimeStampRight)/1000,
-            diff/1000.0f,
-            frameNumberLeft, frameNumberRight);
         tscTimeStampLeft = tscTimeStampLeftNew;
         if (m_rightStream)
         {
@@ -421,7 +451,7 @@ bool StereoDisparityConsumerThread::threadExecute()
             tscTimeStampLeft/1000, tscTimeStampRight/1000,
             diff/1000.0f,
             frameNumberLeft, frameNumberRight);
-		
+
         if (diff/1000.0f > SYNC_THRESHOLD_TIME_US)
         {
             // check if we heave to drop left frame i.e. re-acquire
@@ -620,9 +650,8 @@ static bool execute(const CommonOptions& options)
     PRODUCER_PRINT("Starting repeat capture requests.\n");
     if (iCaptureSession->repeat(request.get()) != STATUS_OK)
         ORIGINATE_ERROR("Failed to start repeat capture request for preview");
-    //ORIGINATE_ERROR("capturetime %d", options.captureTime());
+    //sleep(options.captureTime());
     sleep(1);
-
     // Stop the capture requests and wait until they are complete.
     iCaptureSession->stopRepeat();
     iCaptureSession->waitForIdle();
