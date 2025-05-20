@@ -43,9 +43,17 @@
 // Histogram generation methods borrowed from cudaHistogram sample.
 #include "../cudaHistogram/histogram.h"
 
-
+#include <Argus/Ext/SensorTimestampTsc.h>
+#include <EGLStream/EGLStream.h>
+#define SYNC_THRESHOLD_TIME_US 100.0f
+enum maxCamDevice
+{
+    LEFT_CAM_DEVICE  = 0,
+    RIGHT_CAM_DEVICE = 1,
+    MAX_CAM_DEVICE = 2
+};
 using namespace Argus;
-
+using namespace EGLStream;
 namespace ArgusSamples
 {
 
@@ -76,13 +84,17 @@ class StereoDisparityConsumerThread : public Thread
 {
 public:
     explicit StereoDisparityConsumerThread(IEGLOutputStream *leftStream,
-                                           IEGLOutputStream *rightStream)
+                                           IEGLOutputStream *rightStream,
+                                           OutputStream *OleftStream,
+                                           OutputStream *OrightStream)
                                          : m_leftStream(leftStream)
                                          , m_rightStream(rightStream)
                                          , m_cudaContext(0)
                                          , m_cuStreamLeft(NULL)
                                          , m_cuStreamRight(NULL)
     {
+		m_OleftStream = OleftStream;
+		m_OrightStream = OrightStream;
     }
     ~StereoDisparityConsumerThread()
     {
@@ -95,12 +107,18 @@ private:
     virtual bool threadExecute();
     virtual bool threadShutdown();
     /**@}*/
-
+    UniqueObj<FrameConsumer> m_leftConsumer;
+    UniqueObj<FrameConsumer> m_rightConsumer;
     IEGLOutputStream *m_leftStream;
     IEGLOutputStream *m_rightStream;
     CUcontext         m_cudaContext;
     CUeglStreamConnection m_cuStreamLeft;
     CUeglStreamConnection m_cuStreamRight;
+    
+    uint64_t asyncCount;
+    uint64_t syncCount;
+    OutputStream *m_OleftStream; // left stream tied to sensor index 0 and is used for autocontrol.
+    OutputStream *m_OrightStream; // right stream tied to sensor index 1.
 };
 
 /**
@@ -153,9 +171,22 @@ private:
 
 bool StereoDisparityConsumerThread::threadInitialize()
 {
-    // Create CUDA and connect egl streams.
-    PROPAGATE_ERROR(initCUDA(&m_cudaContext));
+    CONSUMER_PRINT("Creating FrameConsumer for left stream\n");
+    m_leftConsumer = UniqueObj<FrameConsumer>(FrameConsumer::create(m_OleftStream));
+    if (!m_leftConsumer)
+        ORIGINATE_ERROR("Failed to create FrameConsumer for left stream");
 
+    if (m_rightStream)
+    {
+        CONSUMER_PRINT("Creating FrameConsumer for right stream\n");
+        m_rightConsumer = UniqueObj<FrameConsumer>(FrameConsumer::create(m_OrightStream));
+        if (!m_rightConsumer)
+            ORIGINATE_ERROR("Failed to create FrameConsumer for right stream");
+    }
+
+    return true;
+/*    // Create CUDA and connect egl streams.
+    PROPAGATE_ERROR(initCUDA(&m_cudaContext));
     CONSUMER_PRINT("Connecting CUDA consumer to left stream\n");
     CUresult cuResult = cuEGLStreamConsumerConnect(&m_cuStreamLeft, m_leftStream->getEGLStream());
     if (cuResult != CUDA_SUCCESS)
@@ -172,18 +203,65 @@ bool StereoDisparityConsumerThread::threadInitialize()
             getCudaErrorString(cuResult));
     }
     return true;
+*/
 }
 
 bool StereoDisparityConsumerThread::threadExecute()
 {
+	/*
     CONSUMER_PRINT("Waiting for Argus producer to connect to left stream.\n");
     m_leftStream->waitUntilConnected();
 
     CONSUMER_PRINT("Waiting for Argus producer to connect to right stream.\n");
     m_rightStream->waitUntilConnected();
+    */
+    IEGLOutputStream *iLeftStream = m_leftStream;
+    IFrameConsumer* iFrameConsumerLeft = interface_cast<IFrameConsumer>(m_leftConsumer);
 
+    IFrameConsumer* iFrameConsumerRight = NULL;
+    if (m_rightStream)
+    {
+        IEGLOutputStream *iRightStream = m_rightStream;
+        iFrameConsumerRight = interface_cast<IFrameConsumer>(m_rightConsumer);
+        if (!iFrameConsumerRight)
+        {
+            ORIGINATE_ERROR("[right]: Failed to get right stream cosumer\n");
+        }
+        // Wait until the producer has connected to the stream.
+        CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to right stream...\n",
+            "right");
+        if (iRightStream->waitUntilConnected() != STATUS_OK)
+            ORIGINATE_ERROR("Argus producer failed to connect to right stream.");
+        CONSUMER_PRINT("[%s]: Argus producer for right stream has connected; continuing.\n",
+            "right");
+    }
+
+    // Wait until the producer has connected to the stream.
+    CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to left stream...\n",
+        "right");
+    if (iLeftStream->waitUntilConnected() != STATUS_OK)
+        ORIGINATE_ERROR("[%s]Argus producer failed to connect to left stream.\n", "left");
+    CONSUMER_PRINT("[%s]: Argus producer for left stream has connected; continuing.\n",
+        "left");
+
+    unsigned long long tscTimeStampLeft = 0, tscTimeStampLeftNew = 0;
+    unsigned long long frameNumberLeft = 0;
+    unsigned long long tscTimeStampRight = 0, tscTimeStampRightNew = 0;
+    unsigned long long frameNumberRight = 0;
+    unsigned long long diff = 0;
+    IFrame *iFrameLeft = NULL;
+    IFrame *iFrameRight = NULL;
+    Frame *frameleft = NULL;
+    Frame *frameright = NULL;
+    Ext::ISensorTimestampTsc *iSensorTimestampTscLeft = NULL;
+    Ext::ISensorTimestampTsc *iSensorTimestampTscRight = NULL;
+    bool leftDrop = false;
+    bool rightDrop = false;
+    asyncCount = 0;
+    syncCount = 0;
+    
     CONSUMER_PRINT("Streams connected, processing frames.\n");
-    unsigned int histogramLeft[HISTOGRAM_BINS];
+    /*unsigned int histogramLeft[HISTOGRAM_BINS];
     unsigned int histogramRight[HISTOGRAM_BINS];
     while (true)
     {
@@ -232,6 +310,145 @@ bool StereoDisparityConsumerThread::threadExecute()
             CONSUMER_PRINT("KL distance of %6.3f with %5.2f ms computing histograms and "
                            "%5.2f ms spent computing distance\n",
                            distance, time, dTime);
+        }
+    }*/
+    
+    while (true)
+    {
+        if ((diff/1000.0f < SYNC_THRESHOLD_TIME_US) || leftDrop)
+        {
+            frameleft = iFrameConsumerLeft->acquireFrame();
+            if (!frameleft)
+                break;
+
+            leftDrop = false;
+
+            // Use the IFrame interface to print out the frame number/timestamp, and
+            // to provide access to the Image in the Frame.
+            iFrameLeft = interface_cast<IFrame>(frameleft);
+            if (!iFrameLeft)
+                ORIGINATE_ERROR("Failed to get left IFrame interface.");
+
+            CaptureMetadata* captureMetadataLeft =
+                    interface_cast<IArgusCaptureMetadata>(frameleft)->getMetadata();
+            ICaptureMetadata* iMetadataLeft = interface_cast<ICaptureMetadata>(captureMetadataLeft);
+            if (!captureMetadataLeft || !iMetadataLeft)
+                ORIGINATE_ERROR("Cannot get metadata for frame left");
+
+            if (iMetadataLeft->getSourceIndex() != LEFT_CAM_DEVICE)
+                ORIGINATE_ERROR("Incorrect sensor connected to Left stream");
+
+            iSensorTimestampTscLeft =
+                                interface_cast<Ext::ISensorTimestampTsc>(captureMetadataLeft);
+            if (!iSensorTimestampTscLeft)
+                ORIGINATE_ERROR("failed to get iSensorTimestampTscLeft inteface");
+
+            tscTimeStampLeftNew = iSensorTimestampTscLeft->getSensorSofTimestampTsc();
+            frameNumberLeft = iFrameLeft->getNumber();
+        }
+
+        if (m_rightStream && ((diff/1000.0f < SYNC_THRESHOLD_TIME_US) || rightDrop))
+        {
+            frameright = iFrameConsumerRight->acquireFrame();
+            if (!frameright)
+                break;
+
+            rightDrop = false;
+
+            // Use the IFrame interface to print out the frame number/timestamp, and
+            // to provide access to the Image in the Frame.
+            iFrameRight = interface_cast<IFrame>(frameright);
+            if (!iFrameRight)
+                ORIGINATE_ERROR("Failed to get right IFrame interface.");
+
+            CaptureMetadata* captureMetadataRight =
+                    interface_cast<IArgusCaptureMetadata>(frameright)->getMetadata();
+            ICaptureMetadata* iMetadataRight = interface_cast<ICaptureMetadata>(captureMetadataRight);
+            if (!captureMetadataRight || !iMetadataRight)
+            {
+                ORIGINATE_ERROR("Cannot get metadata for frame right");
+            }
+            if (iMetadataRight->getSourceIndex() != RIGHT_CAM_DEVICE)
+                ORIGINATE_ERROR("Incorrect sensor connected to Right stream");
+
+            iSensorTimestampTscRight =
+                                interface_cast<Ext::ISensorTimestampTsc>(captureMetadataRight);
+            if (!iSensorTimestampTscRight)
+                ORIGINATE_ERROR("failed to get iSensorTimestampTscRight inteface");
+
+            tscTimeStampRightNew = iSensorTimestampTscRight->getSensorSofTimestampTsc2();
+            frameNumberRight = iFrameRight->getNumber();
+	
+        }
+ CONSUMER_PRINT("[%s]: left and right diff tsc timestamps (us): { %llu %llu } frame diff{ %llu %llu }, difference (us): %f and frame number: { %llu %llu }\n",
+            "right",
+            tscTimeStampLeft/1000, tscTimeStampRight/1000,
+            (tscTimeStampLeftNew - tscTimeStampLeft)/1000, (tscTimeStampRightNew -tscTimeStampRight)/1000,
+            diff/1000.0f,
+            frameNumberLeft, frameNumberRight);
+        tscTimeStampLeft = tscTimeStampLeftNew;
+        if (m_rightStream)
+        {
+            tscTimeStampRight = tscTimeStampRightNew;
+        }
+        else
+            tscTimeStampRight = tscTimeStampLeft;
+		/*
+        if (kpi)
+        {
+            while ((*sessionsMask >> camDevices[0]) & 1)
+            {
+                // Yield until all cams have updated their timestamps to the perf thread
+                sched_yield();
+            }
+
+            pthread_mutex_lock(&eventMutex);
+            if (m_rightStream){
+                perfBuf->push_back(tscTimeStampRight);
+                *sessionsMask |= 1 << camDevices[1];
+            }
+            perfBuf->push_back(tscTimeStampLeft);
+            *sessionsMask |= 1 << camDevices[0];
+
+            pthread_mutex_unlock(&eventMutex);
+            pthread_cond_signal(&eventCondition);
+        }
+		*/
+        diff = llabs(tscTimeStampLeft - tscTimeStampRight);
+
+        CONSUMER_PRINT("[%s]: left and right tsc timestamps (us): { %llu %llu }, difference (us): %f and frame number: { %llu %llu }\n",
+            "right",
+            tscTimeStampLeft/1000, tscTimeStampRight/1000,
+            diff/1000.0f,
+            frameNumberLeft, frameNumberRight);
+		
+        if (diff/1000.0f > SYNC_THRESHOLD_TIME_US)
+        {
+            // check if we heave to drop left frame i.e. re-acquire
+            if (tscTimeStampLeft < tscTimeStampRight)
+            {
+                leftDrop = true;
+                printf("CONSUMER:[%s]: number { %llu %llu } out of sync detected with diff %f us left is ahead *********\n",
+                    "all", frameNumberLeft, frameNumberRight, diff/1000.0f );
+                iFrameLeft->releaseFrame();
+            }
+            else
+            {
+                rightDrop = true;
+                printf("CONSUMER:[%s]: number { %llu %llu } out of sync detected with diff %f us right is ahead *********\n",
+                    "all", frameNumberLeft, frameNumberRight, diff/1000.0f );
+                iFrameRight->releaseFrame();
+            }
+            asyncCount++;
+            continue;
+        }
+
+        CONSUMER_PRINT("[%s] Synchronized frames captured count %ld.\n", "all", syncCount++);
+        iFrameLeft->releaseFrame();
+
+        if (m_rightStream)
+        {
+            iFrameRight->releaseFrame();
         }
     }
     CONSUMER_PRINT("No more frames. Cleaning up.\n");
@@ -367,6 +584,7 @@ static bool execute(const CommonOptions& options)
     iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
     iEGLStreamSettings->setResolution(STREAM_SIZE);
     iEGLStreamSettings->setEGLDisplay(g_display.get());
+    iEGLStreamSettings->setMetadataEnable(true);
 
     // Create egl streams
     PRODUCER_PRINT("Creating left stream.\n");
@@ -384,7 +602,7 @@ static bool execute(const CommonOptions& options)
         ORIGINATE_ERROR("Failed to create right stream");
 
     PRODUCER_PRINT("Launching disparity checking consumer\n");
-    StereoDisparityConsumerThread disparityConsumer(iStreamLeft, iStreamRight);
+    StereoDisparityConsumerThread disparityConsumer(iStreamLeft, iStreamRight,streamLeft.get(), streamRight.get());
     PROPAGATE_ERROR(disparityConsumer.initialize());
     PROPAGATE_ERROR(disparityConsumer.waitRunning());
 
@@ -402,7 +620,8 @@ static bool execute(const CommonOptions& options)
     PRODUCER_PRINT("Starting repeat capture requests.\n");
     if (iCaptureSession->repeat(request.get()) != STATUS_OK)
         ORIGINATE_ERROR("Failed to start repeat capture request for preview");
-    sleep(options.captureTime());
+    //ORIGINATE_ERROR("capturetime %d", options.captureTime());
+    sleep(1);
 
     // Stop the capture requests and wait until they are complete.
     iCaptureSession->stopRepeat();
