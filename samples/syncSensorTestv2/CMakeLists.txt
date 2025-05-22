@@ -26,7 +26,7 @@
 
 cmake_minimum_required (VERSION 2.6...3.22.1)
 
-project(argus_userautowhitebalance)
+project(argus_syncsensortestv2)
 
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" "${CMAKE_MODULE_PATH}")
 

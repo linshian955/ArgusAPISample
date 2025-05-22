@@ -53,5 +53,6 @@ add_subdirectory(samples/utils)
 add_subdirectory(samples/sensorPrivateMetadata)
 add_subdirectory(samples/yuvOneShot)
 add_subdirectory(samples/syncSensorTest)
+add_subdirectory(samples/syncSensorTestv2)
 
 include(CPack)
