@@ -36,6 +36,7 @@ find_package(EGL REQUIRED)
 
 set(SOURCES
     main.cpp
+    CaptureConsumer.cpp
     )
 
 include_directories(
