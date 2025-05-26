@@ -38,9 +38,11 @@
 #include "CommonOptions.h"
 #include "CaptureConsumer.h"
 #include <algorithm>
-#define FILE_DIR "/home/asus/Desktop/result/"
-#define NENOTOMILLI 1000000.0f
-#define THRESHOLD 5000
+
+#define NENOTOMILLI 1000000.0f //ns to ms
+#define DURATIONTOLRANCE 5000 //5us
+#define SYNCTHRESHOLD 10*1e6 //10ms
+
 // Debug print macros.
 #define PRODUCER_PRINT(...) printf("PRODUCER: " __VA_ARGS__)
 #define CONSUMER_PRINT(...) printf("CONSUMER: " __VA_ARGS__)
@@ -67,11 +69,6 @@ namespace ArgusSamples
 // Globals.
 EGLDisplayHolder g_display;
 
-// Constants
-const float BAYER_CLIP_COUNT_MAX = 0.25f;
-const float BAYER_MISSING_SAMPLE_TOLERANCE = 0.10f;
-const float BAYER_HISTOGRAM_CLIP_PERCENTILE = 0.10f;
-
 /*******************************************************************************
  * Extended options class to add additional options specific to this sample.
  ******************************************************************************/
@@ -97,53 +94,221 @@ protected:
     Value<bool> m_useAverageMap;
 };
 
-/**
- * RAII class for app teardown
- */
-class UserAutoWhiteBalanceTeardown
+class CameraInfo
 {
 public:
+    uint32_t choosedSensorMode;
+    int previewFPS;
+    int countsForCaptureLoop;
+
     CameraProvider* m_cameraProvider;
+    //sensor devices
+    std::vector<CameraDevice*> cameraDevices;
+
+    //sensor mode
+    std::vector<SensorMode*> sensorModes;
+
+    //eventTypes
+    std::vector<EventType> eventTypes;
+
+    IEventProvider *iEventProvider[MAX_CAM_DEVICE];
+    EventQueue *queue[MAX_CAM_DEVICE];    
+    IEventQueue *iQueue[MAX_CAM_DEVICE];
+
+    //capture sessions
+    CaptureSession* captureSession[MAX_CAM_DEVICE];
+    ICaptureSession* iCaptureSession[MAX_CAM_DEVICE];
+    
+    UniqueObj<OutputStreamSettings> streamSettings;
+
+    //preview streams, threads, requests    
+    Request *previewRequest[MAX_CAM_DEVICE];
+    IRequest *iPreviewRequest[MAX_CAM_DEVICE];
+
+    
+    OutputStream *previewStream[MAX_CAM_DEVICE];
+    IEGLOutputStream *iEGLOutputStream[MAX_CAM_DEVICE];   
     PreviewConsumerThread* m_previewConsumerThread;
-    OutputStream* m_stream;
 
-    UserAutoWhiteBalanceTeardown()
+    //capture streams, threads, requests 
+    Request *captureRequest[MAX_CAM_DEVICE];
+    IRequest *iCaptureRequest[MAX_CAM_DEVICE];
+
+    OutputStream *capture_stream[MAX_CAM_DEVICE];
+
+    CaptureConsumerThread* m_captureConsumer[MAX_CAM_DEVICE];
+    
+    CameraInfo(uint32_t sensormode,int fps, int loopCounts)
+        : choosedSensorMode(sensormode), previewFPS(fps), countsForCaptureLoop(loopCounts)
     {
-        m_cameraProvider = NULL;
-        m_previewConsumerThread = NULL;
-        m_stream = NULL;
+        init();
+    }
+    bool init()
+    {
+        std::vector<EGLStreamKHR> eglStreams;
+        m_cameraProvider = CameraProvider::create();
+        getICameraProvider()->getCameraDevices(&cameraDevices);
+        getSensorModes();
+        initEventTypes();
+        
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+            //init CaptureSession
+            captureSession[i] = getICameraProvider()->createCaptureSession(cameraDevices[i]);
+            iCaptureSession[i] = interface_cast<ICaptureSession>(captureSession[i]);
+            EXIT_IF_NULL(iCaptureSession[i], "Cannot get Capture Session Interface");
+
+            //init Event Interface
+            iEventProvider[i] = interface_cast<IEventProvider>(captureSession[i]);
+            EXIT_IF_NULL(iEventProvider[i], "iEventProvider is NULL");
+
+            queue[i] = iEventProvider[i]->createEventQueue(eventTypes);
+            iQueue[i] = interface_cast<IEventQueue>(queue[i]);
+            EXIT_IF_NULL(iQueue[i], "event queue interface is NULL");
+
+            //contruct streams
+
+            //init StreamSettings
+            UniqueObj<OutputStreamSettings> streamSettings(iCaptureSession[i]->createOutputStreamSettings(STREAM_TYPE_EGL));
+            IEGLOutputStreamSettings *iEGLStreamSettings = interface_cast<IEGLOutputStreamSettings>(streamSettings);
+            EXIT_IF_NULL(iEGLStreamSettings, "Cannot get IEGLOutputStreamSettings Interface");
+
+            iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
+            /*
+            iEGLStreamSettings->setResolution(Size2D<uint32_t>(options.windowRect().width(),
+                                                       options.windowRect().height()));*/
+            iEGLStreamSettings->setResolution(Size2D<uint32_t>(1024,
+                                                       768));
+            iEGLStreamSettings->setEGLDisplay(g_display.get());
+            iEGLStreamSettings->setMetadataEnable(true);
+
+            //config preview stream to capturesession
+            previewStream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
+            iEGLOutputStream[i] = interface_cast<IEGLOutputStream>(previewStream[i]);
+            EXIT_IF_NULL(iEGLOutputStream[i], "Cannot get IEGLOutputStream Interface");
+            
+            //keep eglStream instance of preview stream for preview thread
+            eglStreams.push_back(iEGLOutputStream[i]->getEGLStream());
+
+            //config captrue stream to capturesession
+            capture_stream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
+            EXIT_IF_NULL(capture_stream[i], "Failed to create EGLOutputStream");
+
+            //init request of preview and capture
+            previewRequest[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_PREVIEW);
+            iPreviewRequest[i] = interface_cast<IRequest>(previewRequest[i]);
+            EXIT_IF_NULL(iPreviewRequest[i], "Failed to get capture request interface");
+
+            captureRequest[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_STILL_CAPTURE);
+            iCaptureRequest[i] = interface_cast<IRequest>(captureRequest[i]);
+            EXIT_IF_NULL(iCaptureRequest[i], "Failed to get capture request interface");
+
+            //init thread of capture stream
+            m_captureConsumer[i] = new CaptureConsumerThread(capture_stream[i],i);
+            PROPAGATE_ERROR(m_captureConsumer[i]->initialize());
+            PROPAGATE_ERROR(m_captureConsumer[i]->waitRunning());
+        }
+        //init thread of preview stream
+        m_previewConsumerThread = new PreviewConsumerThread(g_display.get(), eglStreams,
+                                        PreviewConsumerThread::LAYOUT_SPLIT_VERTICAL,
+                                        false );
+        PROPAGATE_ERROR(m_previewConsumerThread->initialize());
+        PROPAGATE_ERROR(m_previewConsumerThread->waitRunning());
+        
+        startStreams();
+    }
+    
+    bool startStreams()
+    {
+        if (choosedSensorMode >= sensorModes.size())
+            ORIGINATE_ERROR("Sensor mode index is out of range");
+
+        SensorMode *sensorMode = sensorModes[choosedSensorMode];
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+			//preview streams
+            ISourceSettings *iSourceSettings = interface_cast<ISourceSettings>(iPreviewRequest[i]->getSourceSettings());
+            iSourceSettings->setSensorMode(sensorMode);
+            iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/previewFPS));
+            EXIT_IF_NOT_OK(iPreviewRequest[i]->enableOutputStream(previewStream[i]),"Failed to enable stream in capture request");
+            EXIT_IF_NOT_OK(iCaptureSession[i]->repeat(previewRequest[i]), "Unable to submit repeat() request");
+            //capture streams
+            iSourceSettings = interface_cast<ISourceSettings>(iCaptureRequest[i]->getSourceSettings());
+            iSourceSettings->setSensorMode(sensorMode);
+            iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/previewFPS));
+            EXIT_IF_NOT_OK(iCaptureRequest[i]->enableOutputStream(capture_stream[i]),"Failed to enable stream in capture request");
+        }
     }
 
-    ~UserAutoWhiteBalanceTeardown()
+    ICameraProvider* getICameraProvider()
     {
-        shutdown();
+        return interface_cast<ICameraProvider>(m_cameraProvider);
+    }
+	
+    bool getSensorModes()
+    {
+        if (cameraDevices.size() < 2)
+            ORIGINATE_ERROR("Must have at least 2 sensors available");
+
+        ICameraProperties *iCameraProperties = interface_cast<ICameraProperties>(cameraDevices[0]);
+        if (!iCameraProperties)
+            ORIGINATE_ERROR("Failed to get ICameraProperties interface");
+
+        ISensorMode *iSensorMode;
+        iCameraProperties->getBasicSensorModes(&sensorModes);
+        if (sensorModes.size() == 0)
+            ORIGINATE_ERROR("Failed to get sensor modes");
+
+        printf("Available Sensor modes :\n");
+        for (uint32_t i = 0; i < sensorModes.size(); i++)
+        {
+            iSensorMode = interface_cast<ISensorMode>(sensorModes[i]);
+            Size2D<uint32_t> resolution = iSensorMode->getResolution();
+            printf("[%u] W=%u H=%u\n", i, resolution.width(), resolution.height());
+        }
     }
 
-private:
+    void initEventTypes()
+    {
+        // Create the CaptureSession using the selected device.
+        eventTypes.push_back(EVENT_TYPE_CAPTURE_COMPLETE);
+        eventTypes.push_back(EVENT_TYPE_ERROR);
+        /* Seems there is bug in Argus, which drops EVENT_TYPE_ERROR if all
+        3 events are not set. Set it for now */
+        eventTypes.push_back(EVENT_TYPE_CAPTURE_STARTED);
+    }
+
     void shutdown()
     {
-        // Destroy the output streams (stops consumer threads).
-        if (m_stream != NULL)
-            m_stream->destroy();
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+            iCaptureSession[i]->stopRepeat();
+            iCaptureSession[i]->waitForIdle();
+            if (m_captureConsumer[i] != NULL)
+            {
+                PROPAGATE_ERROR_CONTINUE(m_captureConsumer[i]->shutdown());
+                delete m_captureConsumer[i];
+                m_captureConsumer[i] = NULL;
+            }
+            if(capture_stream[i] != NULL)
+                capture_stream[i]->destroy();
+            if(previewStream[i] != NULL)
+                previewStream[i]->destroy();
 
-        // Wait for the consumer threads to complete.
-        if (m_previewConsumerThread != NULL) {
+        }
+        if (m_previewConsumerThread!= NULL)
+        {
             PROPAGATE_ERROR_CONTINUE(m_previewConsumerThread->shutdown());
             delete m_previewConsumerThread;
             m_previewConsumerThread = NULL;
         }
-
-        // Shut down Argus.
         if (m_cameraProvider != NULL)
             m_cameraProvider->destroy();
+    }
 
-        // Shut down the window (destroys window's EGLSurface).
-        Window::getInstance().shutdown();
-
-        // Cleanup the EGL display
-        PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
+    ~CameraInfo()
+    {
+        shutdown();
     }
 };
+
 
 /*
  * Program: userAutoWhiteBalance
@@ -164,236 +329,90 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
      * queue for completed events
      */
 
-    CameraProvider* m_cameraProvider = CameraProvider::create();
-    ICameraProvider *iCameraProvider = interface_cast<ICameraProvider>(m_cameraProvider);
-    EXIT_IF_NULL(iCameraProvider, "Cannot get core camera provider interface");
-    printf("1Argus Version: %s\n", iCameraProvider->getVersion().c_str());
-
-    // Get the selected camera device and sensor mode.
-    std::vector<CameraDevice*> cameraDevices;
-    iCameraProvider->getCameraDevices(&cameraDevices);
-    if (cameraDevices.size() < 2)
-        ORIGINATE_ERROR("Must have at least 2 sensors available");
-
-    ICameraProperties *iCameraProperties = interface_cast<ICameraProperties>(cameraDevices[0]);
-    if (!iCameraProperties)
-        ORIGINATE_ERROR("Failed to get ICameraProperties interface");
-
-    ISensorMode *iSensorMode;
-    std::vector<SensorMode*> sensorModes;
-    iCameraProperties->getBasicSensorModes(&sensorModes);
-    if (sensorModes.size() == 0)
-        ORIGINATE_ERROR("Failed to get sensor modes");
-
-    PRODUCER_PRINT("Available Sensor modes :\n");
-    for (uint32_t i = 0; i < sensorModes.size(); i++) {
-        iSensorMode = interface_cast<ISensorMode>(sensorModes[i]);
-        Size2D<uint32_t> resolution = iSensorMode->getResolution();
-        PRODUCER_PRINT("[%u] W=%u H=%u\n", i, resolution.width(), resolution.height());
-    }
-    
-    // Create the CaptureSession using the selected device.
-    std::vector<EventType> eventTypes;
-    eventTypes.push_back(EVENT_TYPE_CAPTURE_COMPLETE);
-    eventTypes.push_back(EVENT_TYPE_ERROR);
-    /* Seems there is bug in Argus, which drops EVENT_TYPE_ERROR if all
-    3 events are not set. Set it for now */
-    eventTypes.push_back(EVENT_TYPE_CAPTURE_STARTED);
-    
-    IEventQueue *iQueue[MAX_CAM_DEVICE];
-    ICaptureSession* iCaptureSession[MAX_CAM_DEVICE];
-    CaptureSession* captureSession[MAX_CAM_DEVICE];
-    IEventProvider *iEventProvider[MAX_CAM_DEVICE];
-    EventQueue *queue[MAX_CAM_DEVICE];
-    
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        captureSession[i] = iCameraProvider->createCaptureSession(cameraDevices[i]);
-        iCaptureSession[i] = interface_cast<ICaptureSession>(captureSession[i]);
-        EXIT_IF_NULL(iCaptureSession[i], "Cannot get Capture Session Interface");
-        
-        iEventProvider[i] = interface_cast<IEventProvider>(captureSession[i]);
-        EXIT_IF_NULL(iEventProvider[i], "iEventProvider is NULL");
-        
-        queue[i] = iEventProvider[i]->createEventQueue(eventTypes);
-        iQueue[i] = interface_cast<IEventQueue>(queue[i]);
-        EXIT_IF_NULL(iQueue[i], "event queue interface is NULL");
-   }
-    
-    /*
-     * Creates the stream between the Argus camera image capturing
-     * sub-system (producer) and the image acquisition code (consumer)
-     * preview thread.  A consumer object is created from the stream
-     * to be used to request the image frame.  A successfully submitted
-     * capture request activates the stream's functionality to eventually
-     * make a frame available for acquisition, in the preview thread,
-     * and then display it on the device screen.
-     */
-
-    OutputStream *stream[MAX_CAM_DEVICE];
-    IEGLOutputStream *iEGLOutputStream[MAX_CAM_DEVICE];
-    PreviewConsumerThread* m_previewConsumerThread[MAX_CAM_DEVICE];
-    IRequest *iRequest[MAX_CAM_DEVICE];
-    Request *request[MAX_CAM_DEVICE];
-    
-    IRequest *ijRequest[MAX_CAM_DEVICE];
-    Request *jrequest[MAX_CAM_DEVICE];
-    OutputStream *capture_stream[MAX_CAM_DEVICE];
-
-    std::vector<EGLStreamKHR> eglStreams;
-    EGLStream::IFrameConsumer *iFrameConsumer[MAX_CAM_DEVICE];
-    EGLStream::FrameConsumer *consumer[MAX_CAM_DEVICE];
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        UniqueObj<OutputStreamSettings> streamSettings(
-        iCaptureSession[i]->createOutputStreamSettings(STREAM_TYPE_EGL));
-        
-        IEGLOutputStreamSettings *iEGLStreamSettings =
-            interface_cast<IEGLOutputStreamSettings>(streamSettings);
-        EXIT_IF_NULL(iEGLStreamSettings, "Cannot get IEGLOutputStreamSettings Interface");
-        
-        iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
-        iEGLStreamSettings->setResolution(Size2D<uint32_t>(options.windowRect().width(),
-                                                       options.windowRect().height()));
-        iEGLStreamSettings->setEGLDisplay(g_display.get());    
-        iEGLStreamSettings->setMetadataEnable(true);
-        stream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
-        iEGLOutputStream[i] = interface_cast<IEGLOutputStream>(stream[i]);
-        EXIT_IF_NULL(iEGLOutputStream[i], "Cannot get IEGLOutputStream Interface");
-        eglStreams.push_back(iEGLOutputStream[i]->getEGLStream());
-
-        capture_stream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
-        EXIT_IF_NULL(stream, "Failed to create EGLOutputStream");
-      /*  
-        consumer[i] = EGLStream::FrameConsumer::create(capture_stream[i]);
-
-        iFrameConsumer[i] = Argus::interface_cast<EGLStream::IFrameConsumer>(consumer[i]);
-        EXIT_IF_NULL(iFrameConsumer[i], "Failed to initialize Consumer");
-    */
-
-        request[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_STILL_CAPTURE);
-        iRequest[i] = interface_cast<IRequest>(request[i]);
-        EXIT_IF_NULL(iRequest[i], "Failed to get capture request interface");
-
-        jrequest[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_STILL_CAPTURE);
-        ijRequest[i] = interface_cast<IRequest>(jrequest[i]);
-        EXIT_IF_NULL(iRequest[i], "Failed to get capture request interface");
-    }
-    
-    m_previewConsumerThread[0] = new PreviewConsumerThread(g_display.get(), eglStreams,
-                                     PreviewConsumerThread::LAYOUT_SPLIT_VERTICAL,
-                                     false );
-    PROPAGATE_ERROR(m_previewConsumerThread[0]->initialize());
-    PROPAGATE_ERROR(m_previewConsumerThread[0]->waitRunning());
-
-    CaptureConsumerThread* jpegConsumer[MAX_CAM_DEVICE];
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        jpegConsumer[i] = new CaptureConsumerThread(capture_stream[i],i);
-        PROPAGATE_ERROR(jpegConsumer[i]->initialize());
-        PROPAGATE_ERROR(jpegConsumer[i]->waitRunning());
-    }
-    // Set the sensor mode in the request.
     static uint32_t SENSOR_MODE   = 4;
     static int      CAPTURE_FPS   = 30;
-    /* Check and set sensor mode */
-
-    if (SENSOR_MODE >= sensorModes.size())
-        ORIGINATE_ERROR("Sensor mode index is out of range");
-    SensorMode *sensorMode = sensorModes[SENSOR_MODE];
-    iSensorMode = interface_cast<ISensorMode>(sensorMode);
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        ISourceSettings *iSourceSettings =
-            interface_cast<ISourceSettings>(iRequest[i]->getSourceSettings());
-        iSourceSettings->setSensorMode(sensorMode);
-        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS));
-        EXIT_IF_NOT_OK(iRequest[i]->enableOutputStream(stream[i]),"Failed to enable stream in capture request");
-        EXIT_IF_NOT_OK(iCaptureSession[i]->repeat(request[i]), "Unable to submit repeat() request");
-    }
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        ISourceSettings *iSourceSettings =
-            interface_cast<ISourceSettings>(ijRequest[i]->getSourceSettings());
-        iSourceSettings->setSensorMode(sensorMode);
-        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS));
-        EXIT_IF_NOT_OK(ijRequest[i]->enableOutputStream(capture_stream[i]),"Failed to enable stream in capture request");
-    }
-    /*
-     * Using the image capture event metadata, acquire the bayer histogram and then compute
-     * a weighted average for each channel.  Use these weighted averages to create a White
-     * Balance Channel Gain array to use for setting the manual white balance of the next
-     * capture request.
-     */
-    printf("4Argus Version: %s options.frameCount() %d \n", iCameraProvider->getVersion().c_str(), options.frameCount());
+    int countsForCaptureLoop = 120;
+    
+    CameraInfo cameraSyncInfo(SENSOR_MODE,CAPTURE_FPS,countsForCaptureLoop);
+    
+    const uint64_t FIVE_SECONDS = 5000000000;
+    uint64_t orinframeduration = 1e9/CAPTURE_FPS;
 
     uint32_t frameCaptureLoop = 0;
     bool isAdjust = false;
-    uint64_t orinframeduration = 1e9/CAPTURE_FPS;
     int adjustCamIndex = 0;
+    long long diff;
+    Argus::Status status;
+    const IEventCaptureComplete* iEventCaptureComplete;
+    const CaptureMetadata* metaData;
+    const ICaptureMetadata* iMetadata;
+
     unsigned long long sensorTime[2];
     uint32_t captureId[2];
     uint64_t frameduration[2];
-    long long diff;
-    char filepath[200];
-    int count = 0;
-    int onetime = 1;
-    int countsForCaptureLoop = 120;
-    Argus::Status status;
+    const Event* event[2];
+    const IEvent* iEvent[2];
+
     while (frameCaptureLoop < countsForCaptureLoop)
     {
         // Keep PREVIEW display window serviced
         Window::getInstance().pollEvents();
 
-        const uint64_t FIVE_SECONDS = 5000000000;
-        iEventProvider[0]->waitForEvents(queue[0], FIVE_SECONDS);
-        EXIT_IF_TRUE(iQueue[0]->getSize() == 0, "No events in queue");
-
-        const Event* event = iQueue[0]->getEvent(iQueue[0]->getSize() - 1);
-        const IEvent* iEvent = interface_cast<const IEvent>(event);
-        iEventProvider[1]->waitForEvents(queue[1], FIVE_SECONDS);
-        EXIT_IF_TRUE(iQueue[1]->getSize() == 0, "No events in queue");
-        const Event* event1 = iQueue[1]->getEvent(iQueue[1]->getSize() - 1);
-        const IEvent* iEvent1 = interface_cast<const IEvent>(event1);
-        if (!iEvent)
-            printf("Error : Failed to get IEvent interface\n");
-        else {
-            if (iEvent->getEventType() == EVENT_TYPE_CAPTURE_COMPLETE) {
+        cameraSyncInfo.iEventProvider[0]->waitForEvents(cameraSyncInfo.queue[0], FIVE_SECONDS);
+        EXIT_IF_TRUE(cameraSyncInfo.iQueue[0]->getSize() == 0, "No events in queue");
+        event[0] = cameraSyncInfo.iQueue[0]->getEvent(cameraSyncInfo.iQueue[0]->getSize() - 1);
+        iEvent[0] = interface_cast<const IEvent>(event[0]);
+        
+        cameraSyncInfo.iEventProvider[1]->waitForEvents(cameraSyncInfo.queue[1], FIVE_SECONDS);
+        EXIT_IF_TRUE(cameraSyncInfo.iQueue[1]->getSize() == 0, "No events in queue");
+        event[1] = cameraSyncInfo.iQueue[1]->getEvent(cameraSyncInfo.iQueue[1]->getSize() - 1);
+        iEvent[1] = interface_cast<const IEvent>(event[1]);
+        if(!iEvent[0])
+        {
+            printf("Failed to get IEvent[0] interface");
+        }
+        else
+        {
+            if (iEvent[0]->getEventType() == EVENT_TYPE_CAPTURE_COMPLETE) {
                 frameCaptureLoop++;
-                const IEventCaptureComplete* iEventCaptureComplete =
-                    interface_cast<const IEventCaptureComplete>(event);
-                EXIT_IF_NULL(iEventCaptureComplete, "Failed to get EventCaptureComplete Interface");
-
-                const CaptureMetadata* metaData = iEventCaptureComplete->getMetadata();
-                const ICaptureMetadata* iMetadata = interface_cast<const ICaptureMetadata>(metaData);
-
-                EXIT_IF_NULL(iMetadata, "Failed to get CaptureMetadata Interface");
-                printf("cam 0EVENT_TYPE_CAPTURE_COMPLETE\n");
-                //const TimeValue sensorTime = TimeValue::fromNSec(iMetadata->getSensorTimestamp());
                 
+                //check event contents
+                iEventCaptureComplete = interface_cast<const IEventCaptureComplete>(event[0]);
+                EXIT_IF_NULL(iEventCaptureComplete, "Failed to get EventCaptureComplete Interface");
+                metaData = iEventCaptureComplete->getMetadata();
+                iMetadata = interface_cast<const ICaptureMetadata>(metaData);
+                EXIT_IF_NULL(iMetadata, "Failed to get CaptureMetadata Interface");                
+                printf("iEvent[0] EVENT_TYPE_CAPTURE_COMPLETE\n");
+                
+                //get metadata info
                 sensorTime[0] = iMetadata->getSensorTimestamp();
                 frameduration[0] = iMetadata->getFrameDuration();
-                captureId[0] = iEvent->getCaptureId();
+                captureId[0] = iEvent[0]->getCaptureId();
                 
-                if (iEvent1->getEventType() == EVENT_TYPE_CAPTURE_COMPLETE) {
-                    const IEventCaptureComplete* iEventCaptureComplete1 =
-                       interface_cast<const IEventCaptureComplete>(event1);
+                EXIT_IF_NULL(iEvent[1], "Failed to get IEvent[1] interface");
+                if (iEvent[1]->getEventType() == EVENT_TYPE_CAPTURE_COMPLETE) {
+                   //check event contents
+                    iEventCaptureComplete = interface_cast<const IEventCaptureComplete>(event[1]);
                     EXIT_IF_NULL(iEventCaptureComplete, "Failed to get EventCaptureComplete Interface");
+                    metaData = iEventCaptureComplete->getMetadata();
+                    iMetadata = interface_cast<const ICaptureMetadata>(metaData);
+                    EXIT_IF_NULL(iMetadata, "Failed to get CaptureMetadata Interface");                    
+                    printf("iEvent[1] EVENT_TYPE_CAPTURE_COMPLETE\n");
 
-                    const CaptureMetadata* metaData1 = iEventCaptureComplete1->getMetadata();
-                    const ICaptureMetadata* iMetadata1 = interface_cast<const ICaptureMetadata>(metaData1);
-
-                    EXIT_IF_NULL(iMetadata1, "Failed to get CaptureMetadata Interface");
-                    printf("cam 1 EVENT_TYPE_CAPTURE_COMPLETE\n");
-                    //const TimeValue sensorTime = TimeValue::fromNSec(iMetadata->getSensorTimestamp());
+                    //get metadata info
+                    sensorTime[1] = iMetadata->getSensorTimestamp();
+                    frameduration[1] = iMetadata->getFrameDuration();
+                    captureId[1] = iEvent[1]->getCaptureId();
                     
-                    sensorTime[1] = iMetadata1->getSensorTimestamp();
-                    frameduration[1] = iMetadata1->getFrameDuration();
-                    captureId[1] = iEvent1->getCaptureId();
-                    
+                    //compute timstamp difference
                     diff = labs(sensorTime[1] - sensorTime[0]);
-                    printf("sensorTime %lld - %lld = %lld (%f)\n",
+                    printf("SensorTimeStamp diff: %lld - %lld = %lld (%f)\n",
                         sensorTime[0],
                         sensorTime[1],
                         diff,
-                        sensorTime[1]/1000000.0f - sensorTime[0]/1000000.0f);
-                   //printf("cam2 id %d timestamps %.2f ms\n",iEvent1->getCaptureId() ,sensorTime1/1000000.0f);
-                    printf("duration %ld isAdjust %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %llu frameduration [%ld, %ld]\n",
+                        sensorTime[1]/NENOTOMILLI - sensorTime[0]/NENOTOMILLI);
+
+                    printf("StreamDuration %ld isAdjust %d CaptrueId[%d, %d] TimeStamps [%.2f, %.2f]ms diff %llu Frameduration [%ld, %ld]\n",
                         orinframeduration,
                         isAdjust,
                         captureId[0],
@@ -403,57 +422,29 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                         diff,
                         frameduration[0],
                         frameduration[1]);
-                        /*for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-                            Argus::UniqueObj<EGLStream::Frame> frame(iFrameConsumer[i]->acquireFrame(FIVE_SECONDS, &status));
 
-                            EGLStream::IFrame *iFrame = Argus::interface_cast<EGLStream::IFrame>(frame);
-                            EXIT_IF_NULL(iFrame, "Failed to get IFrame interface");
-
-                            EGLStream::Image *image = iFrame->getImage();
-                            EXIT_IF_NULL(image, "Failed to get Image from iFrame->getImage()");
-                            EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image);
-	                    if(!iImageJPEG)
-	                    {
-	                            ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
-                            }
-
-	                        sprintf(filepath,FILE_DIR "[Cam%d][CaptureId%d][Duration_%ld][Timestamp_%.2fms][diff_%.2fms].jpg",
-	                            i,
-	                            captureId[i],
-	                            frameduration[i],
-	                            sensorTime[i]/NENOTOMILLI,
-	                            diff/NENOTOMILLI);
-	                         
-                            Argus::Status status = iImageJPEG->writeJPEG(filepath);
-                            if(status != Argus::STATUS_OK)
-                            {
-                                ORIGINATE_ERROR("Failed to write JPEG");
-                            }
-                            //iFrameLeft = interface_cast<IFrame>(frameleft);
-                            iFrame->releaseFrame();
-                          }*/
+                    //algorithm to sync sensor by adjust frame duration
                     if (isAdjust)
                     {
                         ISourceSettings *iSourceSettings =
-                            interface_cast<ISourceSettings>(iRequest[adjustCamIndex]->getSourceSettings());
+                            interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
                         iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS));
-                        EXIT_IF_NOT_OK(iCaptureSession[adjustCamIndex]->repeat(request[adjustCamIndex]), "Unable to submit repeat() request");   
-                        //#define NENOTOMILLI 1000000.0f
-                        //#define threshold 5000
-                        if(labs(orinframeduration - frameduration[adjustCamIndex]) < THRESHOLD)
+                        EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");   
+
+                        if(labs(orinframeduration - frameduration[adjustCamIndex]) < DURATIONTOLRANCE)
                         {
                             isAdjust = false;
-                            printf("-----------adjust timestamp back done-------------------------\n");
+                            printf("-----------stop set timestamp back-------------------------\n");
                         }
-                        printf("adjust timestamp back\n");
+                        printf("try to set TimeStamp back\n");
                     }
-                    if (diff > 10*NENOTOMILLI && !isAdjust)
+                    if (diff > SYNCTHRESHOLD && !isAdjust)
                     {
                         adjustCamIndex = sensorTime[1] > sensorTime[0] ? 0 : 1;
                         ISourceSettings *iSourceSettings =
-                            interface_cast<ISourceSettings>(iRequest[adjustCamIndex]->getSourceSettings());
+                            interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
                         iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS + diff/2));
-                        EXIT_IF_NOT_OK(iCaptureSession[adjustCamIndex]->repeat(request[adjustCamIndex]), "Unable to submit repeat() request");
+                        EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
                         isAdjust = true;
                         printf("adjust timestamp of Cam %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
                             adjustCamIndex,
@@ -463,9 +454,8 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                             sensorTime[1]/NENOTOMILLI,
                             diff/NENOTOMILLI);
                     }
-                    else if ( diff < 10*NENOTOMILLI && !isAdjust && onetime && captureId[0] > 100)
+                    else if (diff < 10*NENOTOMILLI && !isAdjust && captureId[0] > 100)
                     {
-                        onetime = 0;
                         printf("dump image of isAdjust %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
                             isAdjust,
                             captureId[0],
@@ -473,49 +463,32 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                             sensorTime[0]/NENOTOMILLI,
                             sensorTime[1]/NENOTOMILLI,
                             diff/NENOTOMILLI);
-		            //iCaptureSession[0]->capture(jrequest[0]);
-                            //iCaptureSession[1]->capture(jrequest[1]);
-		            break;
-                      }
+		                break;
+                     }
                }
-            } else if (iEvent->getEventType() == EVENT_TYPE_CAPTURE_STARTED) {
+            } else if (iEvent[0]->getEventType() == EVENT_TYPE_CAPTURE_STARTED) {
                 /* ToDo: Remove the empty after the bug is fixed */
                 continue;
-            } else if (iEvent->getEventType() == EVENT_TYPE_ERROR) {
+            } else if (iEvent[0]->getEventType() == EVENT_TYPE_ERROR) {
                 const IEventError* iEventError =
-                    interface_cast<const IEventError>(event);
+                    interface_cast<const IEventError>(event[0]);
                 EXIT_IF_NOT_OK(iEventError->getStatus(), "ERROR event");
             } else {
                 printf("WARNING: Unknown event. Continue\n");
             }
         }
     }
-    iCaptureSession[0]->capture(jrequest[0]);
-    iCaptureSession[1]->capture(jrequest[1]);
-    sleep(3);
-    //iSession->stopRepeat is cleaned with captureSession RAII
-    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-        iCaptureSession[i]->stopRepeat();
-        iCaptureSession[i]->waitForIdle();
-        if(capture_stream[i] != NULL)
-            capture_stream[i]->destroy();
-        if(stream[i] != NULL)
-            stream[i]->destroy();
-        if (jpegConsumer[i] != NULL) {
-            PROPAGATE_ERROR_CONTINUE(jpegConsumer[i]->shutdown());
-            delete jpegConsumer[i];
-            jpegConsumer[i] = NULL;
-        }
+    if(frameCaptureLoop < countsForCaptureLoop)
+    {
+        cameraSyncInfo.iCaptureSession[0]->capture(cameraSyncInfo.captureRequest[0]);
+        cameraSyncInfo.iCaptureSession[1]->capture(cameraSyncInfo.captureRequest[1]);
+        sleep(3);
     }
-    if (m_previewConsumerThread[0] != NULL) {
-            PROPAGATE_ERROR_CONTINUE(m_previewConsumerThread[0]->shutdown());
-            delete m_previewConsumerThread[0];
-            m_previewConsumerThread[0] = NULL;
-    }
-    if (m_cameraProvider != NULL)
-        m_cameraProvider->destroy();
+    
+    cameraSyncInfo.shutdown();
     Window::getInstance().shutdown();
     PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
+    sleep(2);
     return true;
 }
 
