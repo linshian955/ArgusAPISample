@@ -47,6 +47,8 @@ namespace ArgusSamples
 #define JPEG_PREFIX "Argus_"
 #endif
 
+#define NENOTOMILLI 1000000
+
 bool CaptureConsumerThread::threadInitialize()
 {
     // Create the FrameConsumer.
@@ -59,6 +61,7 @@ bool CaptureConsumerThread::threadInitialize()
 
 bool CaptureConsumerThread::threadExecute()
 {
+
     IEGLOutputStream *iEGLOutputStream = interface_cast<IEGLOutputStream>(m_stream);
     IFrameConsumer *iFrameConsumer = interface_cast<IFrameConsumer>(m_consumer);
 
@@ -69,48 +72,75 @@ bool CaptureConsumerThread::threadExecute()
     JPEG_CONSUMER_PRINT("Producer has connected; continuing.\n");;
     const uint64_t FIVE_SECONDS = 5000000000;
     Argus::Status status;
-    int frameCount = 0;
+    std::ostringstream fileName;
+    unsigned long long tscTimeStampNew = 0;
+    unsigned long long frameNumber = 0;
+    uint64_t frameduration = 0;
+    Ext::ISensorTimestampTsc *iSensorTimestampTsc = NULL;
+    std::string fileType = imageType == 0 ? ".jpg": ".yuv";
     while (true)
     {
         // Acquire a Frame.
-        //Argus::UniqueObj<EGLStream::Frame> frame(iFrameConsumer[i]->acquireFrame(FIVE_SECONDS, &status));
         UniqueObj<Frame> frame(iFrameConsumer->acquireFrame(FIVE_SECONDS, &status));
         IFrame *iFrame = interface_cast<IFrame>(frame);
         if (!iFrame)
             break;
 
-        // Get the Frame's Image.
-        #define NENOTOMILLI 1000000
-        Image *image = iFrame->getImage();
-        IImageJPEG *iJPEG = interface_cast<IImageJPEG>(image);
-        if (!iJPEG)
-            ORIGINATE_ERROR("Failed to get IImageJPEG interface.");
+        //generate file name
         CaptureMetadata* captureMetadata =
                 interface_cast<IArgusCaptureMetadata>(frame)->getMetadata();
-        unsigned long long tscTimeStampNew = 0;//iMetadata1->getSensorTimestamp();;
-        unsigned long long frameNumber = 0;
-        Ext::ISensorTimestampTsc *iSensorTimestampTsc = NULL;
         ICaptureMetadata* iMetadata = interface_cast<ICaptureMetadata>(captureMetadata);
+        
         frameNumber = iFrame->getNumber();
-        uint64_t frameduration = iMetadata->getFrameDuration();
+        frameduration = iMetadata->getFrameDuration();
         iSensorTimestampTsc = interface_cast<Ext::ISensorTimestampTsc>(captureMetadata);
         if (iSensorTimestampTsc)
         {
             tscTimeStampNew = iSensorTimestampTsc->getSensorSofTimestampTsc();
         }
-        // Write the Image to disk as JPEG.
-        std::ostringstream fileName;
-        fileName << JPEG_PREFIX <<"[T"<<tscTimeStampNew/NENOTOMILLI<<"][FNum_"<<frameNumber<<"][Cam_"<<m_cameraId<<"][D"<< frameduration <<"]"<<".jpg";
-        JPEG_CONSUMER_PRINT("frameNumberRight %lld m_cameraId %d frameduration %ld tscTimeStampRightNew %lld .\n",
+        
+        fileName << JPEG_PREFIX <<"[T"<<tscTimeStampNew/NENOTOMILLI<<"][FNum_"<<frameNumber<<"][Cam_"<<cameraId<<"][D"<< frameduration <<"]"<< fileType;
+        JPEG_CONSUMER_PRINT("frameNumberRight %lld cameraId %d frameduration %ld tscTimeStampRightNew %lld .\n",
             frameNumber,
-            m_cameraId,
+            cameraId,
             frameduration,
             tscTimeStampNew);
 
-        if (iJPEG->writeJPEG(fileName.str().c_str()) == STATUS_OK)
-            JPEG_CONSUMER_PRINT("Captured a still image to '%s'\n", fileName.str().c_str());
+
+        // Get the Frame's Image.
+        Image *image = iFrame->getImage();
+        if(imageType == 0)
+        {
+            IImageJPEG *iJPEG = interface_cast<IImageJPEG>(image);
+        
+            if (!iJPEG)
+                ORIGINATE_ERROR("Failed to get IImageJPEG interface.");
+
+            if (iJPEG->writeJPEG(fileName.str().c_str()) == STATUS_OK)
+                JPEG_CONSUMER_PRINT("Captured a still image to '%s'\n", fileName.str().c_str());
+            else
+                ORIGINATE_ERROR("Failed to write JPEG to '%s'\n", fileName.str().c_str());
+        }
         else
-            ORIGINATE_ERROR("Failed to write JPEG to '%s'\n", fileName.str().c_str());
+        {
+            EGLStream::IImage *yuvIImage = Argus::interface_cast<EGLStream::IImage>(image);
+            if(!yuvIImage)
+                ORIGINATE_ERROR("Failed to get YUV IImage");
+
+            EGLStream::IImage2D *yuvIImage2D = Argus::interface_cast<EGLStream::IImage2D>(image);
+            if(!yuvIImage2D)
+                ORIGINATE_ERROR("Failed to get YUV iImage2D");
+
+            EGLStream::IImageHeaderlessFile *yuvIImageHeaderlessFile =
+            Argus::interface_cast<EGLStream::IImageHeaderlessFile>(image);
+            if(!yuvIImageHeaderlessFile)
+                ORIGINATE_ERROR("Failed to get YUV IImageHeaderlessFile");
+
+            status = yuvIImageHeaderlessFile->writeHeaderlessFile(fileName.str().c_str());
+            printf("Wrote YUV file : %s\n", fileName.str().c_str());
+           // Wait for CAPTURE_TIME seconds.
+       }
+
         
     }
 

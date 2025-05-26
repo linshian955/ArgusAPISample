@@ -38,10 +38,12 @@
 #include "CommonOptions.h"
 #include "CaptureConsumer.h"
 #include <algorithm>
+//add opts control
+#include <getopt.h>
 
 #define NENOTOMILLI 1000000.0f //ns to ms
 #define DURATIONTOLRANCE 5000 //5us
-#define SYNCTHRESHOLD 10*1e6 //10ms
+#define FIVE_SECONDS 5000000000
 
 // Debug print macros.
 #define PRODUCER_PRINT(...) printf("PRODUCER: " __VA_ARGS__)
@@ -72,34 +74,28 @@ EGLDisplayHolder g_display;
 /*******************************************************************************
  * Extended options class to add additional options specific to this sample.
  ******************************************************************************/
-class UserAutoWhiteBalanceSampleOptions : public CommonOptions
+typedef struct
 {
-public:
-    UserAutoWhiteBalanceSampleOptions(const char *programName)
-        : CommonOptions(programName,
-                        ArgusSamples::CommonOptions::Option_D_CameraDevice |
-                        ArgusSamples::CommonOptions::Option_M_SensorMode |
-                        ArgusSamples::CommonOptions::Option_R_WindowRect |
-                        ArgusSamples::CommonOptions::Option_F_FrameCount)
-        , m_useAverageMap(false)
-    {
-        addOption(createValueOption
-            ("useaveragemap", 'a', "0 or 1", "Use Average Map (instead of Bayer Histogram).",
-             m_useAverageMap));
-    }
-
-    bool useAverageMap() const { return m_useAverageMap.get(); }
-
-protected:
-    Value<bool> m_useAverageMap;
-};
+    uint32_t sensor_mode;
+    int selectedFPS;
+    int countsForCaptureLoop;
+    int captrueFameNumber;
+    int width;
+    int height;
+    bool ready;
+    long long syncThreshold;
+    int outputType;
+} InputOptions;
 
 class CameraInfo
 {
 public:
+    //options
     uint32_t choosedSensorMode;
     int previewFPS;
-    int countsForCaptureLoop;
+    int height;
+    int width;
+    int outputType;
 
     CameraProvider* m_cameraProvider;
     //sensor devices
@@ -137,9 +133,19 @@ public:
     OutputStream *capture_stream[MAX_CAM_DEVICE];
 
     CaptureConsumerThread* m_captureConsumer[MAX_CAM_DEVICE];
-    
-    CameraInfo(uint32_t sensormode,int fps, int loopCounts)
-        : choosedSensorMode(sensormode), previewFPS(fps), countsForCaptureLoop(loopCounts)
+
+    CameraInfo()
+    {
+        m_cameraProvider = CameraProvider::create();
+        getICameraProvider()->getCameraDevices(&cameraDevices);
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+            m_captureConsumer[i] = NULL;
+            previewStream[i] = NULL;
+        }
+        m_previewConsumerThread = NULL;
+    }
+    CameraInfo(uint32_t sensormode,int fps, int w, int h, int output)
+        : choosedSensorMode(sensormode), previewFPS(fps), width(w), height(h), outputType(output)
     {
         init();
     }
@@ -176,8 +182,8 @@ public:
             /*
             iEGLStreamSettings->setResolution(Size2D<uint32_t>(options.windowRect().width(),
                                                        options.windowRect().height()));*/
-            iEGLStreamSettings->setResolution(Size2D<uint32_t>(1024,
-                                                       768));
+            iEGLStreamSettings->setResolution(Size2D<uint32_t>(width,
+                                                       height));
             iEGLStreamSettings->setEGLDisplay(g_display.get());
             iEGLStreamSettings->setMetadataEnable(true);
 
@@ -203,7 +209,7 @@ public:
             EXIT_IF_NULL(iCaptureRequest[i], "Failed to get capture request interface");
 
             //init thread of capture stream
-            m_captureConsumer[i] = new CaptureConsumerThread(capture_stream[i],i);
+            m_captureConsumer[i] = new CaptureConsumerThread(capture_stream[i],i,outputType);
             PROPAGATE_ERROR(m_captureConsumer[i]->initialize());
             PROPAGATE_ERROR(m_captureConsumer[i]->waitRunning());
         }
@@ -215,6 +221,7 @@ public:
         PROPAGATE_ERROR(m_previewConsumerThread->waitRunning());
         
         startStreams();
+        return true;
     }
     
     bool startStreams()
@@ -236,6 +243,7 @@ public:
             iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/previewFPS));
             EXIT_IF_NOT_OK(iCaptureRequest[i]->enableOutputStream(capture_stream[i]),"Failed to enable stream in capture request");
         }
+        return true;
     }
 
     ICameraProvider* getICameraProvider()
@@ -264,6 +272,7 @@ public:
             Size2D<uint32_t> resolution = iSensorMode->getResolution();
             printf("[%u] W=%u H=%u\n", i, resolution.width(), resolution.height());
         }
+        return true;
     }
 
     void initEventTypes()
@@ -301,6 +310,8 @@ public:
         }
         if (m_cameraProvider != NULL)
             m_cameraProvider->destroy();
+        Window::getInstance().shutdown();
+        PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
     }
 
     ~CameraInfo()
@@ -317,10 +328,11 @@ public:
  *           through the use of setWbGains() and setAwbMode(AWB_MODE_MANUAL) calls.
  */
 
-static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
+static bool execute(InputOptions& options)
 {
+    static const Argus::Rectangle<uint32_t> DEFAULT_WINDOW_RECT(0, 0, 1024, 768);
     // Initialize the window and EGL display.
-    Window::getInstance().setWindowRect(options.windowRect());
+    Window::getInstance().setWindowRect(DEFAULT_WINDOW_RECT);
     PROPAGATE_ERROR(g_display.initialize(Window::getInstance().getEGLNativeDisplay()));
 
     /*
@@ -329,14 +341,9 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
      * queue for completed events
      */
 
-    static uint32_t SENSOR_MODE   = 4;
-    static int      CAPTURE_FPS   = 30;
-    int countsForCaptureLoop = 120;
+    CameraInfo cameraSyncInfo(options.sensor_mode, options.selectedFPS, options.width, options.height, options.outputType);
     
-    CameraInfo cameraSyncInfo(SENSOR_MODE,CAPTURE_FPS,countsForCaptureLoop);
-    
-    const uint64_t FIVE_SECONDS = 5000000000;
-    uint64_t orinframeduration = 1e9/CAPTURE_FPS;
+    uint64_t orinframeduration = 1e9/options.selectedFPS;
 
     uint32_t frameCaptureLoop = 0;
     bool isAdjust = false;
@@ -353,7 +360,7 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
     const Event* event[2];
     const IEvent* iEvent[2];
 
-    while (frameCaptureLoop < countsForCaptureLoop)
+    while (frameCaptureLoop < options.countsForCaptureLoop)
     {
         // Keep PREVIEW display window serviced
         Window::getInstance().pollEvents();
@@ -428,7 +435,7 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                     {
                         ISourceSettings *iSourceSettings =
                             interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
-                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS));
+                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration));
                         EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");   
 
                         if(labs(orinframeduration - frameduration[adjustCamIndex]) < DURATIONTOLRANCE)
@@ -438,12 +445,12 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                         }
                         printf("try to set TimeStamp back\n");
                     }
-                    if (diff > SYNCTHRESHOLD && !isAdjust)
+                    if (diff > options.syncThreshold && !isAdjust)
                     {
                         adjustCamIndex = sensorTime[1] > sensorTime[0] ? 0 : 1;
                         ISourceSettings *iSourceSettings =
                             interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
-                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/CAPTURE_FPS + diff/2));
+                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration + diff/2));
                         EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
                         isAdjust = true;
                         printf("adjust timestamp of Cam %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
@@ -454,7 +461,7 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
                             sensorTime[1]/NENOTOMILLI,
                             diff/NENOTOMILLI);
                     }
-                    else if (diff < 10*NENOTOMILLI && !isAdjust && captureId[0] > 100)
+                    else if (diff < options.syncThreshold && !isAdjust && captureId[0] > options.captrueFameNumber)
                     {
                         printf("dump image of isAdjust %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
                             isAdjust,
@@ -478,16 +485,14 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
             }
         }
     }
-    if(frameCaptureLoop < countsForCaptureLoop)
+    if(frameCaptureLoop < options.countsForCaptureLoop)
     {
         cameraSyncInfo.iCaptureSession[0]->capture(cameraSyncInfo.captureRequest[0]);
         cameraSyncInfo.iCaptureSession[1]->capture(cameraSyncInfo.captureRequest[1]);
         sleep(3);
     }
     
-    cameraSyncInfo.shutdown();
-    Window::getInstance().shutdown();
-    PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
+    //cameraSyncInfo.shutdown();
     sleep(2);
     return true;
 }
@@ -496,16 +501,94 @@ static bool execute(const UserAutoWhiteBalanceSampleOptions& options)
 
 int main(int argc, char **argv)
 {
-    ArgusSamples::UserAutoWhiteBalanceSampleOptions options(basename(argv[0]));
-    if (!options.parse(argc, argv))
-        return EXIT_FAILURE;
-    if (options.requestedExit())
-        return EXIT_SUCCESS;
+	//default options
+    ArgusSamples::InputOptions options;
+    options.sensor_mode = 1;
+    options.selectedFPS = 30;
+    options.countsForCaptureLoop = 120;
+    options.captrueFameNumber = 100;
+    options.width = 3280;
+    options.height = 2464;
+    options.syncThreshold = 10*1e6;
+    options.outputType = 0;
+    options.ready = true;
+    static std::string optstring = "m:f:t:c:w:e:s:o:h";
+    static int option_index;
+    static struct option long_opts[] {
+        {"sensorMode", optional_argument, NULL, 'm'},
+        {"FPS", optional_argument, NULL, 'f'},
+        {"totalFrameCount", optional_argument, NULL, 't'},
+        {"captureFrameCount", optional_argument, NULL, 'c'},
+        {"width", optional_argument, NULL, 'w'},
+        {"height", optional_argument, NULL, 'h'},
+        {"syncThreshold", optional_argument, NULL, 's'},
+        {"ouputType", optional_argument, NULL, 'o'},
+        {"help", no_argument, NULL, 'e'},
+        {NULL , 0, NULL, 0}
+    };
+    while(1) {
+        int c;
+        c = getopt_long(argc, argv, optstring.c_str(), long_opts, &option_index);
+        
+        if(c == -1)
+            break;
 
-    if (!ArgusSamples::execute(options))
-    {
-        return EXIT_FAILURE;
+        switch(c)
+        {
+            case 'm':
+                options.sensor_mode = atoi(optarg);
+                break;
+            case 'f':
+                options.selectedFPS = atoi(optarg);
+                printf("fps %d",atoi(optarg));
+                break;
+            case 't':
+                options.countsForCaptureLoop = atoi(optarg);
+                break;
+            case 'c':
+                options.captrueFameNumber = atoi(optarg);
+                break;
+            case 'w':
+                options.width = atoi(optarg);
+                break;
+            case 'e':
+                options.height = atoi(optarg);
+                break;
+            case 's':
+                options.syncThreshold = atoi(optarg)*1e6;
+                break;
+            case 'o':
+                options.outputType = atoi(optarg);
+            case 'h':
+            default:
+                ArgusSamples::CameraInfo cameraSyncInfo;
+                printf("----help----\n");
+                printf("sensorMode(-s): choose sensor support modes showed following\n");
+                cameraSyncInfo.getSensorModes();
+                printf("FPS(-s): fps for stream config e.g 30 \n");
+                printf("totalFrameCount(-t): The Test will keep runing after received totalFrameCount frames e.g 120\n");
+                printf("captureFrameCount(-c): tigger caputre when frame number is over captureFrameCount and sensor in sync e.g 100\n");
+                printf("width(-w): width of capture stream e.g 1920\n");
+                printf("height(-e): height of capture stream e.g 1080\n");
+                printf("syncThreshold(-s): the threshold(ms) to check cameras is synced e.g 10\n");
+                printf("----help----\n");
+                options.ready = false;
+                break;
+        }
     }
-
+    if(options.ready)
+    {
+        printf("Input arg:\n sensor_mode %d\n fps %d\n loopCounts %d\n captureFrameNum %d\n wxd %dx%d\n",
+            options.sensor_mode,
+            options.selectedFPS,
+            options.countsForCaptureLoop,
+            options.captrueFameNumber,
+            options.width,
+            options.height);
+        if (!ArgusSamples::execute(options))
+        {
+            return EXIT_FAILURE;
+        }
+    }
     return EXIT_SUCCESS;
 }

@@ -49,8 +49,8 @@ class CaptureConsumerThread : public Thread
 {
 public:
 
-    explicit CaptureConsumerThread(OutputStream *stream, uint32_t cameraId = 2)
-        : m_stream(stream), m_cameraId(cameraId)
+    explicit CaptureConsumerThread(OutputStream *stream, uint32_t id = 2, int type = 0)
+        : m_stream(stream), cameraId(id), imageType(type)
     {
     }
     ~CaptureConsumerThread()
@@ -69,7 +69,8 @@ private:
 
     OutputStream* m_stream;
     UniqueObj<FrameConsumer> m_consumer;
-    uint32_t m_cameraId;
+    uint32_t cameraId;
+    int imageType;
 };
 
 } // namespace ArgusSamples
