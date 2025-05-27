@@ -41,9 +41,9 @@
 //add opts control
 #include <getopt.h>
 
-#define NENOTOMILLI 1000000.0f //ns to ms
-#define DURATIONTOLRANCE 5000 //5us
+#define NENOSECOND_TO_MILLISECOND 1000000.0f //ns to ms
 #define FIVE_SECONDS 5000000000
+#define DURATION_CONTROL_DELAY 5
 
 // Debug print macros.
 #define PRODUCER_PRINT(...) printf("PRODUCER: " __VA_ARGS__)
@@ -179,11 +179,8 @@ public:
             EXIT_IF_NULL(iEGLStreamSettings, "Cannot get IEGLOutputStreamSettings Interface");
 
             iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
-            /*
-            iEGLStreamSettings->setResolution(Size2D<uint32_t>(options.windowRect().width(),
-                                                       options.windowRect().height()));*/
-            iEGLStreamSettings->setResolution(Size2D<uint32_t>(width,
-                                                       height));
+
+            iEGLStreamSettings->setResolution(Size2D<uint32_t>(640, 480));
             iEGLStreamSettings->setEGLDisplay(g_display.get());
             iEGLStreamSettings->setMetadataEnable(true);
 
@@ -194,7 +191,7 @@ public:
             
             //keep eglStream instance of preview stream for preview thread
             eglStreams.push_back(iEGLOutputStream[i]->getEGLStream());
-
+            iEGLStreamSettings->setResolution(Size2D<uint32_t>(width, height));
             //config captrue stream to capturesession
             capture_stream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
             EXIT_IF_NULL(capture_stream[i], "Failed to create EGLOutputStream");
@@ -359,7 +356,7 @@ static bool execute(InputOptions& options)
     uint64_t frameduration[2];
     const Event* event[2];
     const IEvent* iEvent[2];
-
+    uint32_t preAdjustFrameNumber = -DURATION_CONTROL_DELAY;
     while (frameCaptureLoop < options.countsForCaptureLoop)
     {
         // Keep PREVIEW display window serviced
@@ -389,7 +386,7 @@ static bool execute(InputOptions& options)
                 metaData = iEventCaptureComplete->getMetadata();
                 iMetadata = interface_cast<const ICaptureMetadata>(metaData);
                 EXIT_IF_NULL(iMetadata, "Failed to get CaptureMetadata Interface");                
-                printf("iEvent[0] EVENT_TYPE_CAPTURE_COMPLETE\n");
+                //printf("iEvent[0] EVENT_TYPE_CAPTURE_COMPLETE\n");
                 
                 //get metadata info
                 sensorTime[0] = iMetadata->getSensorTimestamp();
@@ -404,7 +401,7 @@ static bool execute(InputOptions& options)
                     metaData = iEventCaptureComplete->getMetadata();
                     iMetadata = interface_cast<const ICaptureMetadata>(metaData);
                     EXIT_IF_NULL(iMetadata, "Failed to get CaptureMetadata Interface");                    
-                    printf("iEvent[1] EVENT_TYPE_CAPTURE_COMPLETE\n");
+                    //printf("iEvent[1] EVENT_TYPE_CAPTURE_COMPLETE\n");
 
                     //get metadata info
                     sensorTime[1] = iMetadata->getSensorTimestamp();
@@ -417,70 +414,92 @@ static bool execute(InputOptions& options)
                         sensorTime[0],
                         sensorTime[1],
                         diff,
-                        sensorTime[1]/NENOTOMILLI - sensorTime[0]/NENOTOMILLI);
-
-                    printf("StreamDuration %ld isAdjust %d CaptrueId[%d, %d] TimeStamps [%.2f, %.2f]ms diff %llu Frameduration [%ld, %ld]\n",
-                        orinframeduration,
-                        isAdjust,
+                        sensorTime[1]/NENOSECOND_TO_MILLISECOND - sensorTime[0]/NENOSECOND_TO_MILLISECOND);
+                    printf("Frame[%d, %d]Timestamps(ms)[%.2f, %.2f]Frameduration[%ld, %ld, %ld]diff[%.2f]\n",
                         captureId[0],
                         captureId[1],
-                        sensorTime[0]/NENOTOMILLI,
-                        sensorTime[1]/NENOTOMILLI,
-                        diff,
+                        sensorTime[0]/NENOSECOND_TO_MILLISECOND,
+                        sensorTime[1]/NENOSECOND_TO_MILLISECOND,
                         frameduration[0],
-                        frameduration[1]);
-
+                        frameduration[1],
+                        orinframeduration,
+                        diff/NENOSECOND_TO_MILLISECOND);
                     //algorithm to sync sensor by adjust frame duration
                     if (isAdjust)
                     {
                         ISourceSettings *iSourceSettings =
                             interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
                         iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration));
-                        EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");   
-
-                        if(labs(orinframeduration - frameduration[adjustCamIndex]) < DURATIONTOLRANCE)
-                        {
-                            isAdjust = false;
-                            printf("-----------stop set timestamp back-------------------------\n");
-                        }
-                        printf("try to set TimeStamp back\n");
-                    }
-                    if (diff > options.syncThreshold && !isAdjust)
-                    {
-                        adjustCamIndex = sensorTime[1] > sensorTime[0] ? 0 : 1;
-                        ISourceSettings *iSourceSettings =
-                            interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
-                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration + diff/2));
                         EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
-                        isAdjust = true;
-                        printf("adjust timestamp of Cam %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
-                            adjustCamIndex,
+                        isAdjust = false;
+                        printf("\n\nFrame[%d, %d]Timestamps[%.2f, %.2f]msdiff[%.2f] setFrameDurationRange back to stream config of Cam[%d] \n\n",
                             captureId[0],
                             captureId[1],
-                            sensorTime[0]/NENOTOMILLI,
-                            sensorTime[1]/NENOTOMILLI,
-                            diff/NENOTOMILLI);
+                            sensorTime[0]/NENOSECOND_TO_MILLISECOND,
+                            sensorTime[1]/NENOSECOND_TO_MILLISECOND,
+                            diff/NENOSECOND_TO_MILLISECOND,
+                            adjustCamIndex);
+                    }
+                    if (diff > options.syncThreshold && !isAdjust && captureId[0] - preAdjustFrameNumber > DURATION_CONTROL_DELAY)
+                    {
+
+                        adjustCamIndex = sensorTime[1] > sensorTime[0] ? 0 : 1;
+                        preAdjustFrameNumber = captureId[adjustCamIndex];
+                        long long steps = diff < orinframeduration/2 ? diff : orinframeduration/2;
+                        ISourceSettings *iSourceSettings =
+                            interface_cast<ISourceSettings>(cameraSyncInfo.iPreviewRequest[adjustCamIndex]->getSourceSettings());
+                        iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration + steps));
+                        EXIT_IF_NOT_OK(cameraSyncInfo.iCaptureSession[adjustCamIndex]->repeat(cameraSyncInfo.previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
+                        isAdjust = true;
+                        printf("\n\nFrame[%d, %d]Timestamps[%.2f, %.2f]msdiff[%.2f] set Cam[%d] FrameDurationRange as %lld \n\n",
+                            captureId[0],
+                            captureId[1],
+                            sensorTime[0]/NENOSECOND_TO_MILLISECOND,
+                            sensorTime[1]/NENOSECOND_TO_MILLISECOND,
+                            diff/NENOSECOND_TO_MILLISECOND,
+                            adjustCamIndex,
+                            orinframeduration + steps);
                     }
                     else if (diff < options.syncThreshold && !isAdjust && captureId[0] > options.captrueFameNumber)
                     {
-                        printf("dump image of isAdjust %d captrueId[%d, %d] timestamps [%.2f, %.2f]ms diff %.2f\n",
-                            isAdjust,
+                        printf("\n\nFrame[%d, %d]Timestamps[%.2f, %.2f]msdiff[%.2f] isAdjust %d dump image\n\n",
                             captureId[0],
                             captureId[1],
-                            sensorTime[0]/NENOTOMILLI,
-                            sensorTime[1]/NENOTOMILLI,
-                            diff/NENOTOMILLI);
-		                break;
-                     }
+                            sensorTime[0]/NENOSECOND_TO_MILLISECOND,
+                            sensorTime[1]/NENOSECOND_TO_MILLISECOND,
+                            diff/NENOSECOND_TO_MILLISECOND,
+                            isAdjust);
+                        break;
+                    }
                }
-            } else if (iEvent[0]->getEventType() == EVENT_TYPE_CAPTURE_STARTED) {
+               else if (iEvent[1]->getEventType() == EVENT_TYPE_CAPTURE_STARTED)
+               {
+                  printf("Event[1] EVENT_TYPE_CAPTURE_STARTED %d\n",cameraSyncInfo.iQueue[0]->getSize());
+                  //event[0] = cameraSyncInfo.iQueue[0]->getEvent(cameraSyncInfo.iQueue[0]->getSize() - 1);
+                  //iEvent[0] = interface_cast<const IEvent>(event[0]);
+                  /* ToDo: Remove the empty after the bug is fixed */
+                  continue;
+               }
+               else if (iEvent[1]->getEventType() == EVENT_TYPE_ERROR) {
+                  const IEventError* iEventError =
+                      interface_cast<const IEventError>(event[0]);
+                  EXIT_IF_NOT_OK(iEventError->getStatus(), "ERROR event");
+               } 
+               else
+               {
+                   printf("WARNING: Unknown event. Continue\n");
+               }
+            }
+            else if (iEvent[0]->getEventType() == EVENT_TYPE_CAPTURE_STARTED) {
                 /* ToDo: Remove the empty after the bug is fixed */
                 continue;
-            } else if (iEvent[0]->getEventType() == EVENT_TYPE_ERROR) {
+            }
+            else if (iEvent[0]->getEventType() == EVENT_TYPE_ERROR) {
                 const IEventError* iEventError =
                     interface_cast<const IEventError>(event[0]);
                 EXIT_IF_NOT_OK(iEventError->getStatus(), "ERROR event");
-            } else {
+            }
+            else {
                 printf("WARNING: Unknown event. Continue\n");
             }
         }
@@ -491,9 +510,6 @@ static bool execute(InputOptions& options)
         cameraSyncInfo.iCaptureSession[1]->capture(cameraSyncInfo.captureRequest[1]);
         sleep(3);
     }
-    
-    //cameraSyncInfo.shutdown();
-    sleep(2);
     return true;
 }
 
@@ -503,16 +519,16 @@ int main(int argc, char **argv)
 {
 	//default options
     ArgusSamples::InputOptions options;
-    options.sensor_mode = 1;
+    options.sensor_mode = 4;
     options.selectedFPS = 30;
-    options.countsForCaptureLoop = 120;
-    options.captrueFameNumber = 100;
-    options.width = 3280;
-    options.height = 2464;
+    options.countsForCaptureLoop = 50;
+    options.captrueFameNumber = 40;
+    options.width = 1280;
+    options.height = 720;
     options.syncThreshold = 10*1e6;
     options.outputType = 0;
     options.ready = true;
-    static std::string optstring = "m:f:t:c:w:e:s:o:h";
+    static std::string optstring = "m:f:t:c:w:h:s:o:e";
     static int option_index;
     static struct option long_opts[] {
         {"sensorMode", optional_argument, NULL, 'm'},
@@ -540,7 +556,6 @@ int main(int argc, char **argv)
                 break;
             case 'f':
                 options.selectedFPS = atoi(optarg);
-                printf("fps %d",atoi(optarg));
                 break;
             case 't':
                 options.countsForCaptureLoop = atoi(optarg);
@@ -551,7 +566,7 @@ int main(int argc, char **argv)
             case 'w':
                 options.width = atoi(optarg);
                 break;
-            case 'e':
+            case 'h':
                 options.height = atoi(optarg);
                 break;
             case 's':
@@ -559,18 +574,19 @@ int main(int argc, char **argv)
                 break;
             case 'o':
                 options.outputType = atoi(optarg);
-            case 'h':
+                break;
             default:
                 ArgusSamples::CameraInfo cameraSyncInfo;
                 printf("----help----\n");
-                printf("sensorMode(-s): choose sensor support modes showed following\n");
+                printf("--sensorMode(-m): choose sensor support modes showed following\n");
                 cameraSyncInfo.getSensorModes();
-                printf("FPS(-s): fps for stream config e.g 30 \n");
-                printf("totalFrameCount(-t): The Test will keep runing after received totalFrameCount frames e.g 120\n");
-                printf("captureFrameCount(-c): tigger caputre when frame number is over captureFrameCount and sensor in sync e.g 100\n");
-                printf("width(-w): width of capture stream e.g 1920\n");
-                printf("height(-e): height of capture stream e.g 1080\n");
-                printf("syncThreshold(-s): the threshold(ms) to check cameras is synced e.g 10\n");
+                printf("--FPS(-f): fps for stream config e.g 30 \n");
+                printf("--totalFrameCount(-t): The Test will keep runing after received totalFrameCount frames e.g 120\n");
+                printf("--captureFrameCount(-c): tigger caputre when frame number is over captureFrameCount and sensor in sync e.g 100\n");
+                printf("--width(-w): width of capture stream e.g 1920\n");
+                printf("--height(-h): height of capture stream e.g 1080\n");
+                printf("--syncThreshold(-s): the threshold(ms) to check cameras is synced e.g 10\n");
+                printf("--outputType(-o): capture file type specifc e.g 0(jpg)/1(yuv)\n");
                 printf("----help----\n");
                 options.ready = false;
                 break;
@@ -578,13 +594,15 @@ int main(int argc, char **argv)
     }
     if(options.ready)
     {
-        printf("Input arg:\n sensor_mode %d\n fps %d\n loopCounts %d\n captureFrameNum %d\n wxd %dx%d\n",
+        printf("Input arg:\n sensor_mode %d\n fps %d\n loopCounts %d\n captureFrameNum %d\n wxd %dx%d\n syncThreshold %lld\n outputType %d\n",
             options.sensor_mode,
             options.selectedFPS,
             options.countsForCaptureLoop,
             options.captrueFameNumber,
             options.width,
-            options.height);
+            options.height,
+            options.syncThreshold,
+            options.outputType);
         if (!ArgusSamples::execute(options))
         {
             return EXIT_FAILURE;
