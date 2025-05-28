@@ -115,7 +115,7 @@ public:
     CaptureSession* captureSession[MAX_CAM_DEVICE];
     ICaptureSession* iCaptureSession[MAX_CAM_DEVICE];
     
-    UniqueObj<OutputStreamSettings> streamSettings;
+    OutputStreamSettings *streamSettings;
 
     //preview streams, threads, requests    
     Request *previewRequest[MAX_CAM_DEVICE];
@@ -130,7 +130,7 @@ public:
     Request *captureRequest[MAX_CAM_DEVICE];
     IRequest *iCaptureRequest[MAX_CAM_DEVICE];
 
-    OutputStream *capture_stream[MAX_CAM_DEVICE];
+    OutputStream *captureStream[MAX_CAM_DEVICE];
 
     CaptureConsumerThread* m_captureConsumer[MAX_CAM_DEVICE];
 
@@ -139,8 +139,10 @@ public:
         m_cameraProvider = CameraProvider::create();
         getICameraProvider()->getCameraDevices(&cameraDevices);
         for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+            iCaptureSession[i] = NULL;
             m_captureConsumer[i] = NULL;
             previewStream[i] = NULL;
+            captureStream[i] = NULL;
         }
         m_previewConsumerThread = NULL;
     }
@@ -174,7 +176,7 @@ public:
             //contruct streams
 
             //init StreamSettings
-            UniqueObj<OutputStreamSettings> streamSettings(iCaptureSession[i]->createOutputStreamSettings(STREAM_TYPE_EGL));
+            streamSettings = iCaptureSession[i]->createOutputStreamSettings(STREAM_TYPE_EGL);
             IEGLOutputStreamSettings *iEGLStreamSettings = interface_cast<IEGLOutputStreamSettings>(streamSettings);
             EXIT_IF_NULL(iEGLStreamSettings, "Cannot get IEGLOutputStreamSettings Interface");
 
@@ -185,7 +187,7 @@ public:
             iEGLStreamSettings->setMetadataEnable(true);
 
             //config preview stream to capturesession
-            previewStream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
+            previewStream[i] = iCaptureSession[i]->createOutputStream(streamSettings);
             iEGLOutputStream[i] = interface_cast<IEGLOutputStream>(previewStream[i]);
             EXIT_IF_NULL(iEGLOutputStream[i], "Cannot get IEGLOutputStream Interface");
             
@@ -193,8 +195,8 @@ public:
             eglStreams.push_back(iEGLOutputStream[i]->getEGLStream());
             iEGLStreamSettings->setResolution(Size2D<uint32_t>(width, height));
             //config captrue stream to capturesession
-            capture_stream[i] = iCaptureSession[i]->createOutputStream(streamSettings.get());
-            EXIT_IF_NULL(capture_stream[i], "Failed to create EGLOutputStream");
+            captureStream[i] = iCaptureSession[i]->createOutputStream(streamSettings);
+            EXIT_IF_NULL(captureStream[i], "Failed to create EGLOutputStream");
 
             //init request of preview and capture
             previewRequest[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_PREVIEW);
@@ -206,7 +208,7 @@ public:
             EXIT_IF_NULL(iCaptureRequest[i], "Failed to get capture request interface");
 
             //init thread of capture stream
-            m_captureConsumer[i] = new CaptureConsumerThread(capture_stream[i],i,outputType);
+            m_captureConsumer[i] = new CaptureConsumerThread(captureStream[i],i,outputType);
             PROPAGATE_ERROR(m_captureConsumer[i]->initialize());
             PROPAGATE_ERROR(m_captureConsumer[i]->waitRunning());
         }
@@ -238,7 +240,7 @@ public:
             iSourceSettings = interface_cast<ISourceSettings>(iCaptureRequest[i]->getSourceSettings());
             iSourceSettings->setSensorMode(sensorMode);
             iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/previewFPS));
-            EXIT_IF_NOT_OK(iCaptureRequest[i]->enableOutputStream(capture_stream[i]),"Failed to enable stream in capture request");
+            EXIT_IF_NOT_OK(iCaptureRequest[i]->enableOutputStream(captureStream[i]),"Failed to enable stream in capture request");
         }
         return true;
     }
@@ -285,32 +287,60 @@ public:
     void shutdown()
     {
         for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
-            iCaptureSession[i]->stopRepeat();
-            iCaptureSession[i]->waitForIdle();
+            if(m_captureConsumer[i] != NULL)
+            {
+                iCaptureSession[i]->stopRepeat();
+                iCaptureSession[i]->waitForIdle();
+                captureSession[i]->destroy();
+                captureSession[i] = NULL;
+            }
             if (m_captureConsumer[i] != NULL)
             {
                 PROPAGATE_ERROR_CONTINUE(m_captureConsumer[i]->shutdown());
                 delete m_captureConsumer[i];
                 m_captureConsumer[i] = NULL;
+            
             }
-            if(capture_stream[i] != NULL)
-                capture_stream[i]->destroy();
+            if (m_previewConsumerThread!= NULL)
+           {
+                PROPAGATE_ERROR_CONTINUE(m_previewConsumerThread->shutdown());
+                delete m_previewConsumerThread;
+                m_previewConsumerThread = NULL;
+                Window::getInstance().shutdown();
+                PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
+            }
+            if(captureStream[i] != NULL)
+            {
+                captureStream[i]->destroy();
+                captureStream[i] = NULL;
+            }
             if(previewStream[i] != NULL)
+            {
                 previewStream[i]->destroy();
-
+                previewStream[i] = NULL;
+            }
+            if(previewRequest[i] != NULL)
+            {
+                previewRequest[i]->destroy();
+                previewRequest[i] = NULL;
+            }
+            if(captureRequest[i] != NULL)
+            {
+                captureRequest[i]->destroy();
+                captureRequest[i] = NULL;
+            }
         }
-        if (m_previewConsumerThread!= NULL)
+        if (streamSettings != NULL)
         {
-            PROPAGATE_ERROR_CONTINUE(m_previewConsumerThread->shutdown());
-            delete m_previewConsumerThread;
-            m_previewConsumerThread = NULL;
+            streamSettings->destroy();
+            streamSettings = NULL;
         }
         if (m_cameraProvider != NULL)
+        {
             m_cameraProvider->destroy();
-        Window::getInstance().shutdown();
-        PROPAGATE_ERROR_CONTINUE(g_display.cleanup());
+            m_cameraProvider = NULL;
+        }
     }
-
     ~CameraInfo()
     {
         shutdown();
@@ -510,6 +540,9 @@ static bool execute(InputOptions& options)
         cameraSyncInfo.iCaptureSession[1]->capture(cameraSyncInfo.captureRequest[1]);
         sleep(3);
     }
+    
+    cameraSyncInfo.shutdown();
+    sleep(2);
     return true;
 }
 
@@ -517,7 +550,7 @@ static bool execute(InputOptions& options)
 
 int main(int argc, char **argv)
 {
-	//default options
+    //default options
     ArgusSamples::InputOptions options;
     options.sensor_mode = 4;
     options.selectedFPS = 30;
@@ -603,6 +636,7 @@ int main(int argc, char **argv)
             options.height,
             options.syncThreshold,
             options.outputType);
+        //return EXIT_SUCCESS;
         if (!ArgusSamples::execute(options))
         {
             return EXIT_FAILURE;
