@@ -1,4 +1,4 @@
-# Copyright (c) 2016-2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2016, NVIDIA CORPORATION. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -26,34 +26,42 @@
 
 cmake_minimum_required (VERSION 2.6...3.22.1)
 
-project (ArgusSamples)
+project(argus_syncsensortestv3)
 
-add_subdirectory(apps/camera)
-add_subdirectory(samples/bayerAverageMap)
-add_subdirectory(samples/cudaBayerDemosaic)
-add_subdirectory(samples/cudaHistogram)
-add_subdirectory(samples/denoise)
-add_subdirectory(samples/demosaicOutput)
-add_subdirectory(samples/eglImage)
-add_subdirectory(samples/gstVideoEncode)
-add_subdirectory(samples/histogram)
-add_subdirectory(samples/multiSensor)
-add_subdirectory(samples/multiStream)
-add_subdirectory(samples/oneShot)
-add_subdirectory(samples/openglBox)
-add_subdirectory(samples/rawBayerOutput)
-add_subdirectory(samples/syncSensor)
-add_subdirectory(samples/syncStereo)
-add_subdirectory(samples/syncStereoRawReprocess)
-add_subdirectory(samples/yuvJpeg)
-add_subdirectory(samples/userAlternatingAutoExposure)
-add_subdirectory(samples/userAutoExposure)
-add_subdirectory(samples/userAutoWhiteBalance)
-add_subdirectory(samples/utils)
-add_subdirectory(samples/sensorPrivateMetadata)
-add_subdirectory(samples/yuvOneShot)
-add_subdirectory(samples/syncSensorTest)
-add_subdirectory(samples/syncSensorTestv2)
-add_subdirectory(samples/syncSensorTestv3)
+set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake" "${CMAKE_MODULE_PATH}")
 
-include(CPack)
+find_package(CUDA)
+
+# Fail silently if CUDA is not found
+if(CUDA_FOUND)
+    find_package(Argus REQUIRED)
+    find_package(OpenGLES REQUIRED)
+    find_package(EGL REQUIRED)
+
+    set(SOURCES
+        main.cpp
+        KLDistance.cu
+        ${CMAKE_SOURCE_DIR}/samples/cudaHistogram/histogram.cu
+        )
+
+    include_directories(
+        ${ARGUS_INCLUDE_DIR}
+        ${EGL_INCLUDE_DIR}
+        ${CMAKE_SOURCE_DIR}/samples/utils
+        ${CMAKE_SOURCE_DIR}/samples/cudaHistogram
+        )
+
+    cuda_add_executable(${PROJECT_NAME} ${SOURCES})
+
+    target_link_libraries(${PROJECT_NAME}
+        ${ARGUS_LIBRARIES}
+        argussampleutils
+        cuda
+        )
+
+    install(TARGETS ${PROJECT_NAME} DESTINATION bin)
+
+    include(CPack)
+else(CUDA_FOUND)
+    message(CUDA toolkit not found, skipping ${PROJECT_NAME})
+endif(CUDA_FOUND)
