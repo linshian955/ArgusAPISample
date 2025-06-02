@@ -46,6 +46,10 @@
 #include <Argus/Ext/SensorTimestampTsc.h>
 #include <EGLStream/EGLStream.h>
 #define SYNC_THRESHOLD_TIME_US 100.0f
+#define FPS 30
+#define NENOSECOND_TO_MILLISECOND 1000000.0f //ns to ms
+#define DURATION_CONTROL_DELAY 5
+#define SYNCTHREHOLD 1*1e6
 enum maxCamDevice
 {
     LEFT_CAM_DEVICE  = 0,
@@ -75,6 +79,12 @@ EGLDisplayHolder g_display;
 #define PRODUCER_PRINT(...) printf("PRODUCER: " __VA_ARGS__)
 #define CONSUMER_PRINT(...) printf("CONSUMER: " __VA_ARGS__)
 
+#define EXIT_IF_TRUE(val,msg)   \
+        {if ((val)) {printf("%s\n",msg); return false;}}
+#define EXIT_IF_NULL(val,msg)   \
+        {if (!val) {printf("%s\n",msg); return false;}}
+#define EXIT_IF_NOT_OK(val,msg) \
+        {if (val!=Argus::STATUS_OK) {printf("%s\n",msg); return false;}}
 /*******************************************************************************
  * Argus disparity class
  *   This class will analyze frames from 2 synchronized sensors and compute the
@@ -84,23 +94,26 @@ EGLDisplayHolder g_display;
 class StereoDisparityConsumerThread : public Thread
 {
 public:
-    explicit StereoDisparityConsumerThread(IEGLOutputStream *leftStream,
-                                           IEGLOutputStream *rightStream,
-                                           OutputStream *OleftStream,
-                                           OutputStream *OrightStream)
-                                         : m_leftStream(leftStream)
-                                         , m_rightStream(rightStream)
-                                         , m_cudaContext(0)
-                                         , m_cuStreamLeft(NULL)
-                                         , m_cuStreamRight(NULL)
+    explicit StereoDisparityConsumerThread(ICaptureSession **iSession,
+                                           OutputStream **pStream,
+                                           Request ** pRequest)
     {
-		m_OleftStream = OleftStream;
-		m_OrightStream = OrightStream;
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+        {
+            iCaptureSession[i] = iSession[i];
+            previewStream[i] = pStream[i];
+            previewRequest[i] = pRequest[i];
+            printf("session %p,stream %p, request %p \n", &iSession[i], &pStream[i], &pRequest[i]);
+        }
     }
     ~StereoDisparityConsumerThread()
     {
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+        {
+            if(iFrame[i])
+                iFrame[i]->releaseFrame();
+        }
     }
-
 private:
     /** @name Thread methods */
     /**@{*/
@@ -108,379 +121,198 @@ private:
     virtual bool threadExecute();
     virtual bool threadShutdown();
     /**@}*/
-    UniqueObj<FrameConsumer> m_leftConsumer;
-    UniqueObj<FrameConsumer> m_rightConsumer;
-    IEGLOutputStream *m_leftStream;
-    IEGLOutputStream *m_rightStream;
-    CUcontext         m_cudaContext;
-    CUeglStreamConnection m_cuStreamLeft;
-    CUeglStreamConnection m_cuStreamRight;
+
+   //capture sessions
+    ICaptureSession* iCaptureSession[MAX_CAM_DEVICE];
+
+    //preview streams, threads, requests    
+    Request *previewRequest[MAX_CAM_DEVICE];
+    IRequest *iPreviewRequest[MAX_CAM_DEVICE];
+
+    OutputStream *previewStream[MAX_CAM_DEVICE];
+    IEGLOutputStream *iEGLOutputStream[MAX_CAM_DEVICE];
+    UniqueObj<FrameConsumer> m_Consumer[MAX_CAM_DEVICE];
+
+    IFrameConsumer* iFrameConsumer[MAX_CAM_DEVICE];
+    CaptureMetadata* captureMetadata[MAX_CAM_DEVICE];
+    ICaptureMetadata* iMetadata[MAX_CAM_DEVICE];
     
-    uint64_t asyncCount;
-    uint64_t syncCount;
-    OutputStream *m_OleftStream; // left stream tied to sensor index 0 and is used for autocontrol.
-    OutputStream *m_OrightStream; // right stream tied to sensor index 1.
+    Frame *frame[MAX_CAM_DEVICE];
+    IFrame *iFrame[MAX_CAM_DEVICE];
+    EGLStream::Image *image[MAX_CAM_DEVICE];
+    
+    Ext::ISensorTimestampTsc *iSensorTimestampTsc[MAX_CAM_DEVICE];
+    unsigned long long tscTimeStamp[MAX_CAM_DEVICE];
+    
+    unsigned long long frameNumber[MAX_CAM_DEVICE];
+    uint64_t frameduration[MAX_CAM_DEVICE];
 };
 
-/**
- * Utility class to acquire and process an EGLStream frame from a CUDA
- * consumer as long as the object is in scope.
- */
-class ScopedCudaEGLStreamFrameAcquire
-{
-public:
-    /**
-     * Constructor blocks until a frame is acquired or an error occurs (ie. stream is
-     * disconnected). Caller should check which condition was satisfied using hasValidFrame().
-     */
-    ScopedCudaEGLStreamFrameAcquire(CUeglStreamConnection& connection);
-
-    /**
-     * Destructor releases frame back to EGLStream.
-     */
-    ~ScopedCudaEGLStreamFrameAcquire();
-
-    /**
-     * Returns true if a frame was acquired (and is compatible with this consumer).
-     */
-    bool hasValidFrame() const;
-
-    /**
-     * Use CUDA to generate a histogram from the acquired frame.
-     * @param[out] histogramData Output array for the histogram.
-     * @param[out] time Time to generate histogram, in milliseconds.
-     */
-    bool generateHistogram(unsigned int histogramData[HISTOGRAM_BINS], float *time);
-
-    /**
-     * Returns the size (resolution) of the frame.
-     */
-    Size2D<uint32_t> getSize() const;
-
-private:
-
-    /**
-     * Returns whether or not the frame format is supported.
-     */
-    bool checkFormat() const;
-
-    CUeglStreamConnection& m_connection;
-    CUstream m_stream;
-    CUgraphicsResource m_resource;
-    CUeglFrame m_frame;
-};
 
 bool StereoDisparityConsumerThread::threadInitialize()
 {
-    CONSUMER_PRINT("Creating FrameConsumer for left stream\n");
-    m_leftConsumer = UniqueObj<FrameConsumer>(FrameConsumer::create(m_OleftStream));
-    if (!m_leftConsumer)
-        ORIGINATE_ERROR("Failed to create FrameConsumer for left stream");
-
-    if (m_rightStream)
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
     {
-        CONSUMER_PRINT("Creating FrameConsumer for right stream\n");
-        m_rightConsumer = UniqueObj<FrameConsumer>(FrameConsumer::create(m_OrightStream));
-        if (!m_rightConsumer)
-            ORIGINATE_ERROR("Failed to create FrameConsumer for right stream");
-    }
+        iEGLOutputStream[i] = interface_cast<IEGLOutputStream>(previewStream[i]);
+        if(iEGLOutputStream[i])
+        {
+            m_Consumer[i] = UniqueObj<FrameConsumer>(FrameConsumer::create(previewStream[i]));
+            if (!m_Consumer[i])
+                ORIGINATE_ERROR("Failed to create FrameConsumer for m_Consumer[%d] stream", i);
+        }
+        printf("iEGLOutputStream %p,previewStream %p, m_Consumer %p \n", &iEGLOutputStream[i], &previewStream[i], &m_Consumer[i]);
 
-    return true;
-/*    // Create CUDA and connect egl streams.
-    PROPAGATE_ERROR(initCUDA(&m_cudaContext));
-    CONSUMER_PRINT("Connecting CUDA consumer to left stream\n");
-    CUresult cuResult = cuEGLStreamConsumerConnect(&m_cuStreamLeft, m_leftStream->getEGLStream());
-    if (cuResult != CUDA_SUCCESS)
-    {
-        ORIGINATE_ERROR("Unable to connect CUDA to EGLStream as a consumer (CUresult %s)",
-            getCudaErrorString(cuResult));
-    }
-
-    CONSUMER_PRINT("Connecting CUDA consumer to right stream\n");
-    cuResult = cuEGLStreamConsumerConnect(&m_cuStreamRight, m_rightStream->getEGLStream());
-    if (cuResult != CUDA_SUCCESS)
-    {
-        ORIGINATE_ERROR("Unable to connect CUDA to EGLStream as a consumer (CUresult %s)",
-            getCudaErrorString(cuResult));
+        iPreviewRequest[i] = interface_cast<IRequest>(previewRequest[i]);
+        EXIT_IF_NULL(iPreviewRequest[i], "Failed to get capture request interface");
     }
     return true;
-*/
 }
 
 bool StereoDisparityConsumerThread::threadExecute()
 {
-	/*
-    CONSUMER_PRINT("Waiting for Argus producer to connect to left stream.\n");
-    m_leftStream->waitUntilConnected();
+    char filepath[80];
+    unsigned long long diff = 0;
+    int adjustCamIndex = 0;
+    unsigned long long preAsyncFrameNumber = -DURATION_CONTROL_DELAY;
+    unsigned long long step = 0;
+    bool isSync = false;
+    uint64_t orinframeduration = 1e9/FPS;
 
-    CONSUMER_PRINT("Waiting for Argus producer to connect to right stream.\n");
-    m_rightStream->waitUntilConnected();
-    */
-    //IEGLOutputStream *iLeftStream = m_leftStream;
-    IFrameConsumer* iFrameConsumerLeft = interface_cast<IFrameConsumer>(m_leftConsumer);
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
 
-    IFrameConsumer* iFrameConsumerRight = NULL;
-    if (m_rightStream)
-    {
-        //IEGLOutputStream *iRightStream = interface_cast<IEGLOutputStream>(m_rightStream);
-        iFrameConsumerRight = interface_cast<IFrameConsumer>(m_rightConsumer);
-        if (!iFrameConsumerRight)
+        iFrameConsumer[i] = interface_cast<IFrameConsumer>(m_Consumer[i]);
+        if (!iFrameConsumer[i])
         {
-            ORIGINATE_ERROR("[right]: Failed to get right stream cosumer\n");
+            ORIGINATE_ERROR("iFrameConsumer[%d]: Failed to get stream cosumer\n",i);
         }
         // Wait until the producer has connected to the stream.
-        CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to right stream...\n",
-            "right");
-        if (m_rightStream->waitUntilConnected() != STATUS_OK)
+        CONSUMER_PRINT("iEGLOutputStream[%d]: Waiting until Argus producer is connected to stream...\n",
+            i);
+        if (iEGLOutputStream[i]->waitUntilConnected() != STATUS_OK)
             ORIGINATE_ERROR("Argus producer failed to connect to right stream.");
-        CONSUMER_PRINT("[%s]: Argus producer for right stream has connected; continuing.\n",
-            "right");
+        CONSUMER_PRINT("iEGLOutputStream[%d]: Argus producer has connected; continuing.\n", i);
     }
-
-    // Wait until the producer has connected to the stream.
-    CONSUMER_PRINT("[%s]: Waiting until Argus producer is connected to left stream...\n",
-        "right");
-    if (m_leftStream->waitUntilConnected() != STATUS_OK)
-        ORIGINATE_ERROR("[%s]Argus producer failed to connect to left stream.\n", "left");
-    CONSUMER_PRINT("[%s]: Argus producer for left stream has connected; continuing.\n",
-        "left");
-
-    unsigned long long tscTimeStampLeft = 0, tscTimeStampLeftNew = 0;
-    unsigned long long frameNumberLeft = 0;
-    unsigned long long tscTimeStampRight = 0, tscTimeStampRightNew = 0;
-    unsigned long long frameNumberRight = 0;
-    unsigned long long diff = 0;
-    IFrame *iFrameLeft = NULL;
-    IFrame *iFrameRight = NULL;
-    Frame *frameleft = NULL;
-    Frame *frameright = NULL;
-    Ext::ISensorTimestampTsc *iSensorTimestampTscLeft = NULL;
-    Ext::ISensorTimestampTsc *iSensorTimestampTscRight = NULL;
-    bool leftDrop = false;
-    bool rightDrop = false;
-    asyncCount = 0;
-    syncCount = 0;
-    char filepath[80];    
-    CONSUMER_PRINT("Streams connected, processing frames.\n");
-    /*unsigned int histogramLeft[HISTOGRAM_BINS];
-    unsigned int histogramRight[HISTOGRAM_BINS];
-    while (true)
-    {
-        EGLint streamState = EGL_STREAM_STATE_CONNECTING_KHR;
-
-        // Check both the streams and proceed only if they are not in DISCONNECTED state.
-        if (!eglQueryStreamKHR(
-                    m_leftStream->getEGLDisplay(),
-                    m_leftStream->getEGLStream(),
-                    EGL_STREAM_STATE_KHR,
-                    &streamState) || (streamState == EGL_STREAM_STATE_DISCONNECTED_KHR))
-        {
-            CONSUMER_PRINT("left : EGL_STREAM_STATE_DISCONNECTED_KHR received\n");
-            break;
-        }
-
-        if (!eglQueryStreamKHR(
-                    m_rightStream->getEGLDisplay(),
-                    m_rightStream->getEGLStream(),
-                    EGL_STREAM_STATE_KHR,
-                    &streamState) || (streamState == EGL_STREAM_STATE_DISCONNECTED_KHR))
-        {
-            CONSUMER_PRINT("right : EGL_STREAM_STATE_DISCONNECTED_KHR received\n");
-            break;
-        }
-
-        ScopedCudaEGLStreamFrameAcquire left(m_cuStreamLeft);
-        ScopedCudaEGLStreamFrameAcquire right(m_cuStreamRight);
-
-        if (!left.hasValidFrame() || !right.hasValidFrame())
-            break;
-
-        // Calculate histograms.
-        float time = 0.0f;
-        if (left.generateHistogram(histogramLeft, &time) &&
-            right.generateHistogram(histogramRight, &time))
-        {
-            // Calculate KL distance.
-            float distance = 0.0f;
-            Size2D<uint32_t> size = right.getSize();
-            float dTime = computeKLDistance(histogramRight,
-                                            histogramLeft,
-                                            HISTOGRAM_BINS,
-                                            size.width() * size.height(),
-                                            &distance);
-            CONSUMER_PRINT("KL distance of %6.3f with %5.2f ms computing histograms and "
-                           "%5.2f ms spent computing distance\n",
-                           distance, time, dTime);
-        }
-    }*/
     
     while (true)
     {
-        if ((diff/1000.0f < SYNC_THRESHOLD_TIME_US) || leftDrop)
-        {
-            frameleft = iFrameConsumerLeft->acquireFrame();
-            if (!frameleft)
-                break;
-
-            leftDrop = false;
-
-            // Use the IFrame interface to print out the frame number/timestamp, and
-            // to provide access to the Image in the Frame.
-            iFrameLeft = interface_cast<IFrame>(frameleft);
-            if (!iFrameLeft)
-                ORIGINATE_ERROR("Failed to get left IFrame interface.");
-
-            CaptureMetadata* captureMetadataLeft =
-                    interface_cast<IArgusCaptureMetadata>(frameleft)->getMetadata();
-            ICaptureMetadata* iMetadataLeft = interface_cast<ICaptureMetadata>(captureMetadataLeft);
-            if (!captureMetadataLeft || !iMetadataLeft)
-                ORIGINATE_ERROR("Cannot get metadata for frame left");
-
-            if (iMetadataLeft->getSourceIndex() != LEFT_CAM_DEVICE)
-                ORIGINATE_ERROR("Incorrect sensor connected to Left stream");
-
-            iSensorTimestampTscLeft =
-                                interface_cast<Ext::ISensorTimestampTsc>(captureMetadataLeft);
-            if (!iSensorTimestampTscLeft)
-                ORIGINATE_ERROR("failed to get iSensorTimestampTscLeft inteface");
-
-            tscTimeStampLeftNew = iSensorTimestampTscLeft->getSensorSofTimestampTsc();
-            frameNumberLeft = iFrameLeft->getNumber();
-	    EGLStream::Image *image = iFrameLeft->getImage();
-	    if(!image)
+        for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
 	    {
-                ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
-            }
-		EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image);
-	    if(!iImageJPEG)
-	    {
-	        ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
-            }
+			//get frame
+            frame[i] = iFrameConsumer[i]->acquireFrame();
+            iFrame[i] = interface_cast<IFrame>(frame[i]);
 
-	    sprintf(filepath,FILE_DIR "Left_FrameNum%llu_Diff%.2f_timestamp%llu.jpg",frameNumberLeft,(tscTimeStampLeftNew-tscTimeStampRight)/1000000.0f,tscTimeStampLeftNew);
-            Argus::Status status = iImageJPEG->writeJPEG(filepath);
-            if(status != Argus::STATUS_OK)
-            {
-                ORIGINATE_ERROR("Failed to write JPEG");
-            }
-	    printf("Wrote file: %s",filepath);
+            if (!iFrame[i])
+               continue;
+
+            //get metadata
+            captureMetadata[i] = interface_cast<IArgusCaptureMetadata>(frame[i])->getMetadata();
+            iMetadata[i] = interface_cast<ICaptureMetadata>(captureMetadata[i]);
+            if (!captureMetadata || !iMetadata)
+                ORIGINATE_ERROR("Cannot get metadata for frame of cam %d", i);
+
+            /*
+            // seems only works when two camera assign to one capture session
+            if (iMetadata[i]->getSourceIndex() != i)
+                ORIGINATE_ERROR("Incorrect sensor connected to stream %d %d", i,iMetadata[i]->getSourceIndex());
+            */
+
+            //get timestamp interface
+            iSensorTimestampTsc[i] = interface_cast<Ext::ISensorTimestampTsc>(captureMetadata[i]);
+            if (!iSensorTimestampTsc[i])
+                ORIGINATE_ERROR("failed to get iSensorTimestampTsc[%d] inteface", i);
+
+            //record related infomations
+            tscTimeStamp[i] = iSensorTimestampTsc[i]->getSensorSofTimestampTsc();
+            frameNumber[i] = iFrame[i]->getNumber();
+            image[i] = iFrame[i]->getImage();
+            frameduration[i] = iMetadata[i]->getFrameDuration();
+            printf("Camera[%d]FrameNumber[%lld]Timestamp[%lld]Frameduration[%ld]\n",
+                i,
+                frameNumber[i],
+                tscTimeStamp[i],
+                frameduration[i]);
         }
-
-        if (m_rightStream && ((diff/1000.0f < SYNC_THRESHOLD_TIME_US) || rightDrop))
+        if(!frame[1] || !frame[0])
         {
-            frameright = iFrameConsumerRight->acquireFrame();
-            if (!frameright)
-                break;
-
-            rightDrop = false;
-
-            // Use the IFrame interface to print out the frame number/timestamp, and
-            // to provide access to the Image in the Frame.
-            iFrameRight = interface_cast<IFrame>(frameright);
-            if (!iFrameRight)
-                ORIGINATE_ERROR("Failed to get right IFrame interface.");
-
-            CaptureMetadata* captureMetadataRight =
-                    interface_cast<IArgusCaptureMetadata>(frameright)->getMetadata();
-            ICaptureMetadata* iMetadataRight = interface_cast<ICaptureMetadata>(captureMetadataRight);
-            if (!captureMetadataRight || !iMetadataRight)
-            {
-                ORIGINATE_ERROR("Cannot get metadata for frame right");
-            }
-            if (iMetadataRight->getSourceIndex() != RIGHT_CAM_DEVICE)
-                ORIGINATE_ERROR("Incorrect sensor connected to Right stream");
-
-            iSensorTimestampTscRight =
-                                interface_cast<Ext::ISensorTimestampTsc>(captureMetadataRight);
-            if (!iSensorTimestampTscRight)
-                ORIGINATE_ERROR("failed to get iSensorTimestampTscRight inteface");
-
-            tscTimeStampRightNew = iSensorTimestampTscRight->getSensorSofTimestampTsc2();
-            frameNumberRight = iFrameRight->getNumber();
-	    EGLStream::Image *image = iFrameRight->getImage();
-	    if(!image)
-	    {
-                ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
-            }
-		EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image);
-	    if(!iImageJPEG)
-	    {
-	        ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
-            }
-
-	    sprintf(filepath,FILE_DIR "Right_FrameNum%llu_Diff%.2f_timestamp%llu.jpg",frameNumberLeft,(tscTimeStampLeftNew-tscTimeStampRight)/1000000.0f,tscTimeStampLeftNew);
-            Argus::Status status = iImageJPEG->writeJPEG(filepath);
-            if(status != Argus::STATUS_OK)
-            {
-                ORIGINATE_ERROR("Failed to write JPEG");
-            }
-	    printf("Wrote file: %s",filepath);
+            break;
         }
-        tscTimeStampLeft = tscTimeStampLeftNew;
-        if (m_rightStream)
+        printf("Timestamp dfferent calculation start\n");
+        diff = labs(tscTimeStamp[1] - tscTimeStamp[0]);
+        if (isSync)
         {
-            tscTimeStampRight = tscTimeStampRightNew;
+            ISourceSettings *iSourceSettings =
+                interface_cast<ISourceSettings>(iPreviewRequest[adjustCamIndex]->getSourceSettings());
+            iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration));
+            EXIT_IF_NOT_OK(iCaptureSession[adjustCamIndex]->repeat(previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
+            isSync = false;
+            printf("\n\nFrameNumber[%lld, %lld]Timestamps(ms)[%.2f, %.2f]Diff[%.2f] SetFrameDurationRange back to stream config of Cam[%d] \n\n",
+                        frameNumber[0],
+                        frameNumber[1],
+                        tscTimeStamp[0]/NENOSECOND_TO_MILLISECOND,
+                        tscTimeStamp[1]/NENOSECOND_TO_MILLISECOND,
+                        diff/NENOSECOND_TO_MILLISECOND,
+                        adjustCamIndex);
         }
-        else
-            tscTimeStampRight = tscTimeStampLeft;
-		/*
-        if (kpi)
+        if (diff > SYNCTHREHOLD && !isSync && frameNumber[0] - preAsyncFrameNumber > DURATION_CONTROL_DELAY)
         {
-            while ((*sessionsMask >> camDevices[0]) & 1)
-            {
-                // Yield until all cams have updated their timestamps to the perf thread
-                sched_yield();
-            }
+            //get related infomations
+            adjustCamIndex = tscTimeStamp[1] > tscTimeStamp[0] ? 0 : 1;
+            preAsyncFrameNumber = frameNumber[adjustCamIndex];
+            step = diff < orinframeduration/2 ? diff : orinframeduration/2;
+            
+            //modify frame duration
+            ISourceSettings *iSourceSettings =
+                interface_cast<ISourceSettings>(iPreviewRequest[adjustCamIndex]->getSourceSettings());
+            iSourceSettings->setFrameDurationRange(Range<uint64_t>(orinframeduration + step));
+            EXIT_IF_NOT_OK(iCaptureSession[adjustCamIndex]->repeat(previewRequest[adjustCamIndex]), "Unable to submit repeat() request");
 
-            pthread_mutex_lock(&eventMutex);
-            if (m_rightStream){
-                perfBuf->push_back(tscTimeStampRight);
-                *sessionsMask |= 1 << camDevices[1];
-            }
-            perfBuf->push_back(tscTimeStampLeft);
-            *sessionsMask |= 1 << camDevices[0];
+            isSync = true;
+            
+            printf("\n\nFrameNumber[%lld, %lld]Timestamps(ms)[%.2f, %.2f]Diff[%.2f] set Camera[%d] FrameDurationRange as %lld \n\n",
+                            frameNumber[0],
+                            frameNumber[1],
+                            tscTimeStamp[0]/NENOSECOND_TO_MILLISECOND,
+                            tscTimeStamp[1]/NENOSECOND_TO_MILLISECOND,
+                            diff/NENOSECOND_TO_MILLISECOND,
+                            adjustCamIndex,
+                            orinframeduration + step);
+         }
+         else if (diff < SYNCTHREHOLD && !isSync)
+         {
+             printf("\n\nFrameNumber[%lld, %lld]Timestamps(ms)[%.2f, %.2f]Diff[%.2f] isSync %d Dump image\n\n",
+                        frameNumber[0],
+                        frameNumber[1],
+                        tscTimeStamp[0]/NENOSECOND_TO_MILLISECOND,
+                        tscTimeStamp[1]/NENOSECOND_TO_MILLISECOND,
+                        diff/NENOSECOND_TO_MILLISECOND,
+                        isSync);
+             for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+             {
+                 if(!image[i])
+	             {
+                     ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
+                 }
+                 
+		         EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image[i]);
+	             if(!iImageJPEG)
+	             {
+	                 ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
+                 }
+	             sprintf(filepath,FILE_DIR "[T%.2f][FNum%llu]Cam[%d][D%ld].jpg",
+	                 tscTimeStamp[i]/NENOSECOND_TO_MILLISECOND,
+	                 frameNumber[i],
+	                 i,
+	                 frameduration[i]);
 
-            pthread_mutex_unlock(&eventMutex);
-            pthread_cond_signal(&eventCondition);
-        }
-		*/
-        diff = llabs(tscTimeStampLeft - tscTimeStampRight);
-
-        CONSUMER_PRINT("[%s]: left and right tsc timestamps (us): { %llu %llu }, difference (us): %f and frame number: { %llu %llu }\n",
-            "right",
-            tscTimeStampLeft/1000, tscTimeStampRight/1000,
-            diff/1000.0f,
-            frameNumberLeft, frameNumberRight);
-
-        if (diff/1000.0f > SYNC_THRESHOLD_TIME_US)
-        {
-            // check if we heave to drop left frame i.e. re-acquire
-            if (tscTimeStampLeft < tscTimeStampRight)
-            {
-                leftDrop = true;
-                printf("CONSUMER:[%s]: number { %llu %llu } out of sync detected with diff %f us left is ahead *********\n",
-                    "all", frameNumberLeft, frameNumberRight, diff/1000.0f );
-                iFrameLeft->releaseFrame();
-            }
-            else
-            {
-                rightDrop = true;
-                printf("CONSUMER:[%s]: number { %llu %llu } out of sync detected with diff %f us right is ahead *********\n",
-                    "all", frameNumberLeft, frameNumberRight, diff/1000.0f );
-                iFrameRight->releaseFrame();
-            }
-            asyncCount++;
-            continue;
-        }
-
-        CONSUMER_PRINT("[%s] Synchronized frames captured count %ld.\n", "all", syncCount++);
-        iFrameLeft->releaseFrame();
-
-        if (m_rightStream)
-        {
-            iFrameRight->releaseFrame();
-        }
-    }
+                 Argus::Status status = iImageJPEG->writeJPEG(filepath);
+             }
+         }
+         for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+         {
+             if(iFrame[i])
+                 iFrame[i]->releaseFrame();
+         }
+     }
     CONSUMER_PRINT("No more frames. Cleaning up.\n");
 
     PROPAGATE_ERROR(requestShutdown());
@@ -490,88 +322,11 @@ bool StereoDisparityConsumerThread::threadExecute()
 
 bool StereoDisparityConsumerThread::threadShutdown()
 {
-    // Disconnect from the streams.
-    cuEGLStreamConsumerDisconnect(&m_cuStreamLeft);
-    cuEGLStreamConsumerDisconnect(&m_cuStreamRight);
-
-    PROPAGATE_ERROR(cleanupCUDA(&m_cudaContext));
-
-    CONSUMER_PRINT("Done.\n");
+    CONSUMER_PRINT("threadShutdown----------\n");
     return true;
 }
 
-ScopedCudaEGLStreamFrameAcquire::ScopedCudaEGLStreamFrameAcquire(CUeglStreamConnection& connection)
-    : m_connection(connection)
-    , m_stream(NULL)
-    , m_resource(0)
-{
-    CUresult r = cuEGLStreamConsumerAcquireFrame(&m_connection, &m_resource, &m_stream, -1);
-    if (r == CUDA_SUCCESS)
-    {
-        cuGraphicsResourceGetMappedEglFrame(&m_frame, m_resource, 0, 0);
-    }
-}
 
-ScopedCudaEGLStreamFrameAcquire::~ScopedCudaEGLStreamFrameAcquire()
-{
-    if (m_resource)
-    {
-        cuEGLStreamConsumerReleaseFrame(&m_connection, m_resource, &m_stream);
-    }
-}
-
-bool ScopedCudaEGLStreamFrameAcquire::hasValidFrame() const
-{
-    return m_resource && checkFormat();
-}
-
-bool ScopedCudaEGLStreamFrameAcquire::generateHistogram(unsigned int histogramData[HISTOGRAM_BINS],
-                                                        float *time)
-{
-    if (!hasValidFrame() || !histogramData || !time)
-        ORIGINATE_ERROR("Invalid state or output parameters");
-
-    // Create surface from luminance channel.
-    CUDA_RESOURCE_DESC cudaResourceDesc;
-    memset(&cudaResourceDesc, 0, sizeof(cudaResourceDesc));
-    cudaResourceDesc.resType = CU_RESOURCE_TYPE_ARRAY;
-    cudaResourceDesc.res.array.hArray = m_frame.frame.pArray[0];
-    CUsurfObject cudaSurfObj = 0;
-    CUresult cuResult = cuSurfObjectCreate(&cudaSurfObj, &cudaResourceDesc);
-    if (cuResult != CUDA_SUCCESS)
-    {
-        ORIGINATE_ERROR("Unable to create the surface object (CUresult %s)",
-                         getCudaErrorString(cuResult));
-    }
-
-    // Generated the histogram.
-    *time += histogram(cudaSurfObj, m_frame.width, m_frame.height, histogramData);
-
-    // Destroy surface.
-    cuSurfObjectDestroy(cudaSurfObj);
-
-    return true;
-}
-
-Size2D<uint32_t> ScopedCudaEGLStreamFrameAcquire::getSize() const
-{
-    if (hasValidFrame())
-        return Size2D<uint32_t>(m_frame.width, m_frame.height);
-    return Size2D<uint32_t>(0, 0);
-}
-
-bool ScopedCudaEGLStreamFrameAcquire::checkFormat() const
-{
-    if (!isCudaFormatYUV(m_frame.eglColorFormat))
-    {
-        ORIGINATE_ERROR("Only YUV color formats are supported");
-    }
-    if (m_frame.cuFormat != CU_AD_FORMAT_UNSIGNED_INT8)
-    {
-        ORIGINATE_ERROR("Only 8-bit unsigned int formats are supported");
-    }
-    return true;
-}
 
 static bool execute(const CommonOptions& options)
 {
@@ -593,80 +348,121 @@ static bool execute(const CommonOptions& options)
     if (cameraDevices.size() < 2)
         ORIGINATE_ERROR("Must have at least 2 sensors available");
 
-    std::vector <CameraDevice*> lrCameras;
-    lrCameras.push_back(cameraDevices[0]); // Left Camera (the 1st camera will be used for AC)
-    lrCameras.push_back(cameraDevices[1]); // Right Camera
+    //Get supported sensor modes
+    ICameraProperties *iCameraProperties = interface_cast<ICameraProperties>(cameraDevices[1]);
+    if (!iCameraProperties)
+        ORIGINATE_ERROR("Failed to get ICameraProperties interface");
 
-    // Create the capture session, AutoControl will be based on what the 1st device sees.
-    UniqueObj<CaptureSession> captureSession(iCameraProvider->createCaptureSession(lrCameras));
-    ICaptureSession *iCaptureSession = interface_cast<ICaptureSession>(captureSession);
-    if (!iCaptureSession)
-        ORIGINATE_ERROR("Failed to get capture session interface");
+    std::vector<SensorMode*> sensorModes;
+    ISensorMode *iSensorMode;
+    iCameraProperties->getBasicSensorModes(&sensorModes);
+    if (sensorModes.size() == 0)
+        ORIGINATE_ERROR("Failed to get sensor modes");
 
-    // Create stream settings object and set settings common to both streams.
-    UniqueObj<OutputStreamSettings> streamSettings(
-        iCaptureSession->createOutputStreamSettings(STREAM_TYPE_EGL));
-    IOutputStreamSettings *iStreamSettings = interface_cast<IOutputStreamSettings>(streamSettings);
-    IEGLOutputStreamSettings *iEGLStreamSettings =
-        interface_cast<IEGLOutputStreamSettings>(streamSettings);
-    if (!iStreamSettings || !iEGLStreamSettings)
-        ORIGINATE_ERROR("Failed to create OutputStreamSettings");
-    iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
-    iEGLStreamSettings->setResolution(STREAM_SIZE);
-    iEGLStreamSettings->setEGLDisplay(g_display.get());
-    iEGLStreamSettings->setMetadataEnable(true);
+    printf("Available Sensor modes :\n");
+    for (uint32_t i = 0; i < sensorModes.size(); i++)
+    {
+        iSensorMode = interface_cast<ISensorMode>(sensorModes[i]);
+        Size2D<uint32_t> resolution = iSensorMode->getResolution();
+        printf("[%u] W=%u H=%u\n", i, resolution.width(), resolution.height());
+    }
 
-    // Create egl streams
-    PRODUCER_PRINT("Creating left stream.\n");
-    iStreamSettings->setCameraDevice(lrCameras[0]);
-    UniqueObj<OutputStream> streamLeft(iCaptureSession->createOutputStream(streamSettings.get()));
-    IEGLOutputStream *iStreamLeft = interface_cast<IEGLOutputStream>(streamLeft);
-    if (!iStreamLeft)
-        ORIGINATE_ERROR("Failed to create left stream");
+   //capture sessions
+    CaptureSession* captureSession[MAX_CAM_DEVICE] = {NULL};
+    ICaptureSession* iCaptureSession[MAX_CAM_DEVICE] = {NULL};
+    
+    OutputStreamSettings *streamSettings[MAX_CAM_DEVICE] = {NULL};
 
-    PRODUCER_PRINT("Creating right stream.\n");
-    iStreamSettings->setCameraDevice(lrCameras[1]);
-    UniqueObj<OutputStream> streamRight(iCaptureSession->createOutputStream(streamSettings.get()));
-    IEGLOutputStream *iStreamRight = interface_cast<IEGLOutputStream>(streamRight);
-    if (!iStreamRight)
-        ORIGINATE_ERROR("Failed to create right stream");
+    //preview streams, threads, requests    
+    Request *previewRequest[MAX_CAM_DEVICE] = {NULL};
+    IRequest *iPreviewRequest[MAX_CAM_DEVICE] = {NULL};
+
+    OutputStream *previewStream[MAX_CAM_DEVICE] = {NULL};
+
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+        //init CaptureSession
+        captureSession[i] = iCameraProvider->createCaptureSession(cameraDevices[i]);
+        iCaptureSession[i] = interface_cast<ICaptureSession>(captureSession[i]);
+        EXIT_IF_NULL(iCaptureSession[i], "Cannot get Capture Session Interface");
+
+        //contruct streams
+
+        //init StreamSettings
+        streamSettings[i] = iCaptureSession[i]->createOutputStreamSettings(STREAM_TYPE_EGL);
+        //setting if two camera in one camera session, default set as first camera in camera session
+        IOutputStreamSettings *iStreamSettings = interface_cast<IOutputStreamSettings>(streamSettings[i]);
+        iStreamSettings->setCameraDevice(cameraDevices[i]);
+        IEGLOutputStreamSettings *iEGLStreamSettings = interface_cast<IEGLOutputStreamSettings>(streamSettings[i]);
+        EXIT_IF_NULL(iEGLStreamSettings, "Cannot get IEGLOutputStreamSettings Interface");
+
+        iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
+
+        iEGLStreamSettings->setResolution(STREAM_SIZE);
+        iEGLStreamSettings->setEGLDisplay(g_display.get());
+        iEGLStreamSettings->setMetadataEnable(true);
+
+        //config preview stream to capturesession
+        previewStream[i] = iCaptureSession[i]->createOutputStream(streamSettings[i]);
+
+        //init request of preview and capture
+        previewRequest[i] = iCaptureSession[i]->createRequest(CAPTURE_INTENT_PREVIEW);
+        iPreviewRequest[i] = interface_cast<IRequest>(previewRequest[i]);
+        EXIT_IF_NULL(iPreviewRequest[i], "Failed to get capture request interface");
+        
+    }
 
     PRODUCER_PRINT("Launching disparity checking consumer\n");
-    StereoDisparityConsumerThread disparityConsumer(iStreamLeft, iStreamRight,streamLeft.get(), streamRight.get());
+    StereoDisparityConsumerThread disparityConsumer(iCaptureSession, previewStream, previewRequest);
     PROPAGATE_ERROR(disparityConsumer.initialize());
     PROPAGATE_ERROR(disparityConsumer.waitRunning());
 
-    // Create a request
-    UniqueObj<Request> request(iCaptureSession->createRequest());
-    IRequest *iRequest = interface_cast<IRequest>(request);
-    if (!iRequest)
-        ORIGINATE_ERROR("Failed to create Request");
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+        ISourceSettings *iSourceSettings = interface_cast<ISourceSettings>(iPreviewRequest[i]->getSourceSettings());
+        iSourceSettings->setSensorMode(sensorModes[4]);
+        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/FPS));
+        EXIT_IF_NOT_OK(iPreviewRequest[i]->enableOutputStream(previewStream[i]),"Failed to enable stream in capture request");
+        EXIT_IF_NOT_OK(iCaptureSession[i]->repeat(previewRequest[i]), "Unable to submit repeat() request");
+    }
 
-    // Enable both streams in the request.
-    iRequest->enableOutputStream(streamLeft.get());
-    iRequest->enableOutputStream(streamRight.get());
-
-    // Submit capture for the specified time.
-    PRODUCER_PRINT("Starting repeat capture requests.\n");
-    if (iCaptureSession->repeat(request.get()) != STATUS_OK)
-        ORIGINATE_ERROR("Failed to start repeat capture request for preview");
     //sleep(options.captureTime());
     sleep(1);
-    // Stop the capture requests and wait until they are complete.
-    iCaptureSession->stopRepeat();
-    iCaptureSession->waitForIdle();
 
-    // Disconnect Argus producer from the EGLStreams (and unblock consumer acquire).
-    PRODUCER_PRINT("Captures complete, disconnecting producer.\n");
-    iStreamLeft->disconnect();
-    iStreamRight->disconnect();
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+        iCaptureSession[i]->stopRepeat();
+        iCaptureSession[i]->waitForIdle();
 
-    // Wait for the consumer thread to complete.
+        // Disconnect Argus producer from the EGLStreams (and unblock consumer acquire).
+        PRODUCER_PRINT("Captures complete, disconnecting producer.\n");
+        interface_cast<IEGLOutputStream>(previewStream[i])->disconnect();
+    }
+    
     PROPAGATE_ERROR(disparityConsumer.shutdown());
-
+    PRODUCER_PRINT("Captures complete, shutdown thread.\n");
+    for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
+        if(captureSession[i])
+        {
+            captureSession[i]->destroy();
+            captureSession[i] = NULL;
+        }
+        if(previewRequest[i])
+        {
+            previewRequest[i]->destroy();
+            previewRequest[i] = NULL;
+        }
+        if(previewStream[i])
+        {
+            previewStream[i]->destroy();
+            previewStream[i] = NULL;
+        }
+        if(streamSettings[i])
+        {
+            streamSettings[i]->destroy();
+            streamSettings[i] = NULL;
+        }
+    }
     // Shut down Argus.
     cameraProvider.reset();
-
+    PRODUCER_PRINT("Captures complete, reset .\n");
     // Cleanup the EGL display
     PROPAGATE_ERROR(g_display.cleanup());
 
