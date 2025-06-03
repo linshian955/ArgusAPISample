@@ -45,11 +45,11 @@
 
 #include <Argus/Ext/SensorTimestampTsc.h>
 #include <EGLStream/EGLStream.h>
-#define SYNC_THRESHOLD_TIME_US 100.0f
-#define FPS 30
+
+#include <getopt.h>
 #define NENOSECOND_TO_MILLISECOND 1000000.0f //ns to ms
 #define DURATION_CONTROL_DELAY 5
-#define SYNCTHREHOLD 1*1e6
+
 enum maxCamDevice
 {
     LEFT_CAM_DEVICE  = 0,
@@ -58,7 +58,21 @@ enum maxCamDevice
 };
 using namespace Argus;
 using namespace EGLStream;
-#define FILE_DIR "/home/asus/Desktop/result/"
+
+typedef struct
+{
+    bool isDumpImage;
+    bool ready;
+    int sensorMode;
+    int selectedFPS;
+    int captureTime;
+    int width;
+    int height;
+    int outputType;
+    std::string outputPath;
+    long long syncThreshold;
+} InputOptions;
+
 namespace ArgusSamples
 {
 
@@ -68,9 +82,6 @@ namespace ArgusSamples
  * 0 indicates that the two images are alike. The processing of the images happens in the worker
  * thread of StereoDisparityConsumerThread. While the main app thread is used to drive the captures.
  */
-
-// Constants.
-static const Size2D<uint32_t> STREAM_SIZE(640, 480);
 
 // Globals and derived constants.
 EGLDisplayHolder g_display;
@@ -96,7 +107,8 @@ class StereoDisparityConsumerThread : public Thread
 public:
     explicit StereoDisparityConsumerThread(ICaptureSession **iSession,
                                            OutputStream **pStream,
-                                           Request ** pRequest)
+                                           Request ** pRequest,
+                                           InputOptions& opts) : options(opts)
     {
         for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
         {
@@ -122,6 +134,7 @@ private:
     virtual bool threadShutdown();
     /**@}*/
 
+    InputOptions options;
    //capture sessions
     ICaptureSession* iCaptureSession[MAX_CAM_DEVICE];
 
@@ -160,7 +173,6 @@ bool StereoDisparityConsumerThread::threadInitialize()
             if (!m_Consumer[i])
                 ORIGINATE_ERROR("Failed to create FrameConsumer for m_Consumer[%d] stream", i);
         }
-        printf("iEGLOutputStream %p,previewStream %p, m_Consumer %p \n", &iEGLOutputStream[i], &previewStream[i], &m_Consumer[i]);
 
         iPreviewRequest[i] = interface_cast<IRequest>(previewRequest[i]);
         EXIT_IF_NULL(iPreviewRequest[i], "Failed to get capture request interface");
@@ -176,8 +188,7 @@ bool StereoDisparityConsumerThread::threadExecute()
     unsigned long long preAsyncFrameNumber = -DURATION_CONTROL_DELAY;
     unsigned long long step = 0;
     bool isSync = false;
-    uint64_t orinframeduration = 1e9/FPS;
-
+    uint64_t orinframeduration = 1e9/options.selectedFPS;
     for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
 
         iFrameConsumer[i] = interface_cast<IFrameConsumer>(m_Consumer[i]);
@@ -253,7 +264,7 @@ bool StereoDisparityConsumerThread::threadExecute()
                         diff/NENOSECOND_TO_MILLISECOND,
                         adjustCamIndex);
         }
-        if (diff > SYNCTHREHOLD && !isSync && frameNumber[0] - preAsyncFrameNumber > DURATION_CONTROL_DELAY)
+        if (diff > options.syncThreshold && !isSync && frameNumber[0] - preAsyncFrameNumber > DURATION_CONTROL_DELAY)
         {
             //get related infomations
             adjustCamIndex = tscTimeStamp[1] > tscTimeStamp[0] ? 0 : 1;
@@ -277,7 +288,7 @@ bool StereoDisparityConsumerThread::threadExecute()
                             adjustCamIndex,
                             orinframeduration + step);
          }
-         else if (diff < SYNCTHREHOLD && !isSync)
+         else if (diff < options.syncThreshold && !isSync)
          {
              printf("\n\nFrameNumber[%lld, %lld]Timestamps(ms)[%.2f, %.2f]Diff[%.2f] isSync %d Dump image\n\n",
                         frameNumber[0],
@@ -286,25 +297,56 @@ bool StereoDisparityConsumerThread::threadExecute()
                         tscTimeStamp[1]/NENOSECOND_TO_MILLISECOND,
                         diff/NENOSECOND_TO_MILLISECOND,
                         isSync);
-             for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+             if(options.isDumpImage)
              {
-                 if(!image[i])
-	             {
-                     ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
-                 }
-                 
+                 if(options.outputType == 0)
+                 {
+                     for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+                     {
+                         if(!image[i])
+	                 {
+                             ORIGINATE_ERROR("Failed to get Image from iFrame->getImage()");
+                         }
 		         EGLStream::IImageJPEG *iImageJPEG = Argus::interface_cast<EGLStream::IImageJPEG>(image[i]);
-	             if(!iImageJPEG)
-	             {
-	                 ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
+	                 if(!iImageJPEG)
+	                 {
+	                     ORIGINATE_ERROR("Failed to get ImageJPEG Interface");
+                         }
+                         sprintf(filepath,"%s[T%.2f][FNum%llu]Cam[%d][D%ld].jpg",
+    	                     options.outputPath.c_str(),
+    	                     tscTimeStamp[i]/NENOSECOND_TO_MILLISECOND,
+	                     frameNumber[i],
+	                     i,
+	                     frameduration[i]);
+                         printf("Wrote JPG file : %s\n", filepath);
+                         Argus::Status status = iImageJPEG->writeJPEG(filepath);
+                     }
                  }
-	             sprintf(filepath,FILE_DIR "[T%.2f][FNum%llu]Cam[%d][D%ld].jpg",
-	                 tscTimeStamp[i]/NENOSECOND_TO_MILLISECOND,
-	                 frameNumber[i],
-	                 i,
-	                 frameduration[i]);
+                 else if(options.outputType == 1)
+                 {
+                     for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
+                     {
+                         EGLStream::IImage *yuvIImage = Argus::interface_cast<EGLStream::IImage>(image[i]);
+                         if(!yuvIImage)
+                             ORIGINATE_ERROR("Failed to get YUV IImage");
 
-                 Argus::Status status = iImageJPEG->writeJPEG(filepath);
+                         EGLStream::IImage2D *yuvIImage2D = Argus::interface_cast<EGLStream::IImage2D>(image[i]);
+                         if(!yuvIImage2D)
+                             ORIGINATE_ERROR("Failed to get YUV iImage2D");
+
+                         EGLStream::IImageHeaderlessFile *yuvIImageHeaderlessFile = Argus::interface_cast<EGLStream::IImageHeaderlessFile>(image[i]);
+                         if(!yuvIImageHeaderlessFile)
+                             ORIGINATE_ERROR("Failed to get YUV IImageHeaderlessFile");
+                         sprintf(filepath,"%s[T%.2f][FNum%llu]Cam[%d][D%ld].yuv",
+    	                     options.outputPath.c_str(),
+    	                     tscTimeStamp[i]/NENOSECOND_TO_MILLISECOND,
+	                     frameNumber[i],
+	                     i,
+	                     frameduration[i]);
+                         Argus::Status status = yuvIImageHeaderlessFile->writeHeaderlessFile(filepath);
+                         printf("Wrote YUV file : %s\n", filepath);
+                     }
+                 }
              }
          }
          for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++)
@@ -326,9 +368,44 @@ bool StereoDisparityConsumerThread::threadShutdown()
     return true;
 }
 
+bool getSensorModes()
+{
+    // Initialize the Argus camera provider.
+    UniqueObj<CameraProvider> cameraProvider(CameraProvider::create());
 
+    // Get the ICameraProvider interface from the global CameraProvider.
+    ICameraProvider *iCameraProvider = interface_cast<ICameraProvider>(cameraProvider);
+    if (!iCameraProvider)
+        ORIGINATE_ERROR("Failed to get ICameraProvider interface");
 
-static bool execute(const CommonOptions& options)
+    // Get the camera devices.
+    std::vector<CameraDevice*> cameraDevices;
+    iCameraProvider->getCameraDevices(&cameraDevices);
+    if (cameraDevices.size() < 2)
+        ORIGINATE_ERROR("Must have at least 2 sensors available");
+
+    //Get supported sensor modes
+    ICameraProperties *iCameraProperties = interface_cast<ICameraProperties>(cameraDevices[0]);
+    if (!iCameraProperties)
+        ORIGINATE_ERROR("Failed to get ICameraProperties interface");
+
+    std::vector<SensorMode*> sensorModes;
+    ISensorMode *iSensorMode;
+    iCameraProperties->getBasicSensorModes(&sensorModes);
+    if (sensorModes.size() == 0)
+        ORIGINATE_ERROR("Failed to get sensor modes");
+
+    printf("Available Sensor modes :\n");
+    for (uint32_t i = 0; i < sensorModes.size(); i++)
+    {
+        iSensorMode = interface_cast<ISensorMode>(sensorModes[i]);
+        Size2D<uint32_t> resolution = iSensorMode->getResolution();
+        printf("[%u] W=%u H=%u\n", i, resolution.width(), resolution.height());
+    }
+    return true;
+}
+
+static bool execute(InputOptions& options)
 {
     // Initialize EGL.
     PROPAGATE_ERROR(g_display.initialize());
@@ -397,7 +474,7 @@ static bool execute(const CommonOptions& options)
 
         iEGLStreamSettings->setPixelFormat(PIXEL_FMT_YCbCr_420_888);
 
-        iEGLStreamSettings->setResolution(STREAM_SIZE);
+        iEGLStreamSettings->setResolution(Size2D<uint32_t>(options.width, options.height));
         iEGLStreamSettings->setEGLDisplay(g_display.get());
         iEGLStreamSettings->setMetadataEnable(true);
 
@@ -412,21 +489,22 @@ static bool execute(const CommonOptions& options)
     }
 
     PRODUCER_PRINT("Launching disparity checking consumer\n");
-    StereoDisparityConsumerThread disparityConsumer(iCaptureSession, previewStream, previewRequest);
+    StereoDisparityConsumerThread disparityConsumer(iCaptureSession, previewStream, previewRequest, options);
     PROPAGATE_ERROR(disparityConsumer.initialize());
     PROPAGATE_ERROR(disparityConsumer.waitRunning());
 
     for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
         ISourceSettings *iSourceSettings = interface_cast<ISourceSettings>(iPreviewRequest[i]->getSourceSettings());
-        iSourceSettings->setSensorMode(sensorModes[4]);
-        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/FPS));
+        iSourceSettings->setSensorMode(sensorModes[options.sensorMode]);
+        iSourceSettings->setFrameDurationRange(Range<uint64_t>(1e9/options.selectedFPS));
         EXIT_IF_NOT_OK(iPreviewRequest[i]->enableOutputStream(previewStream[i]),"Failed to enable stream in capture request");
         EXIT_IF_NOT_OK(iCaptureSession[i]->repeat(previewRequest[i]), "Unable to submit repeat() request");
     }
 
-    //sleep(options.captureTime());
-    sleep(1);
+    sleep(options.captureTime);
 
+
+    //release stage
     for (uint32_t i = 0; i < MAX_CAM_DEVICE; i++) {
         iCaptureSession[i]->stopRepeat();
         iCaptureSession[i]->waitForIdle();
@@ -474,15 +552,101 @@ static bool execute(const CommonOptions& options)
 
 int main(int argc, char *argv[])
 {
-    ArgusSamples::CommonOptions options(basename(argv[0]),
-                                        ArgusSamples::CommonOptions::Option_T_CaptureTime);
-    if (!options.parse(argc, argv))
-        return EXIT_FAILURE;
-    if (options.requestedExit())
-        return EXIT_SUCCESS;
+    //default options
+    static InputOptions options;
+    options.sensorMode = 4;
+    options.selectedFPS = 30;
+    options.captureTime = 5;
+    options.isDumpImage = true;
+    options.width = 640;
+    options.height = 480;
+    options.syncThreshold = 5*1e6;
+    options.outputType = 0;
+    options.outputPath = "";
+    options.ready = true;
+    static std::string optstring = "m:f:t:d:w:h:s:o:p:e";
+    static int option_index;
+    static struct option long_opts[] {
+        {"sensorMode", optional_argument, NULL, 'm'},
+        {"FPS", optional_argument, NULL, 'f'},
+        {"captureTime", optional_argument, NULL, 't'},
+        {"isDumpImage", optional_argument, NULL, 'd'},
+        {"width", optional_argument, NULL, 'w'},
+        {"height", optional_argument, NULL, 'h'},
+        {"syncThreshold", optional_argument, NULL, 's'},
+        {"ouputType", optional_argument, NULL, 'o'},
+        {"ouputPath", optional_argument, NULL, 'p'},
+        {"help", no_argument, NULL, 'e'},
+        {NULL , 0, NULL, 0}
+    };
+    while(1) {
+        int c;
+        c = getopt_long(argc, argv, optstring.c_str(), long_opts, &option_index);
+        
+        if(c == -1)
+            break;
 
-    if (!ArgusSamples::execute(options))
-        return EXIT_FAILURE;
-
+        switch(c)
+        {
+            case 'm':
+                options.sensorMode = atoi(optarg);
+                break;
+            case 'f':
+                options.selectedFPS = atoi(optarg);
+                break;
+            case 't':
+                options.captureTime = atoi(optarg);
+                break;
+            case 'd':
+                options.isDumpImage = atoi(optarg);
+                break;
+            case 'w':
+                options.width = atoi(optarg);
+                break;
+            case 'h':
+                options.height = atoi(optarg);
+                break;
+            case 's':
+                options.syncThreshold = atoi(optarg)*1e6;
+                break;
+            case 'o':
+                options.outputType = atoi(optarg);
+                break;
+            case 'p':
+                options.outputPath = optarg;
+                break;
+            default:
+                printf("----help----\n");
+                printf("--sensorMode(-m): choose sensor support modes showed following\n");
+                ArgusSamples::getSensorModes();
+                printf("--FPS(-f): fps for stream config e.g 30 \n");
+                printf("--captureTime(-t): The Test will keep runing after sleep t seconds e.g 2\n");
+                printf("--isDumpImage(-d): is need dump frame image e.g 1\n");
+                printf("--width(-w): width of capture stream e.g 1920\n");
+                printf("--height(-h): height of capture stream e.g 1080\n");
+                printf("--syncThreshold(-s): the threshold(ms) to check cameras is synced e.g 10\n");
+                printf("--outputType(-o): capture file type specifc e.g 0(jpg)/1(yuv)\n");
+                printf("--outputPath(-p): capture file output path e.g /home/user/Desktop/result/\n");
+                printf("----help----\n");
+                options.ready = false;
+                break;
+        }
+    }
+    if(options.ready)
+    {
+        printf("Input arg:\n sensor_mode %d\n fps %d\n captureTime %d\n isDumpImage %d\n wxd %dx%d\n syncThreshold %lld\n outputType %d\n",
+            options.sensorMode,
+            options.selectedFPS,
+            options.captureTime,
+            options.isDumpImage,
+            options.width,
+            options.height,
+            options.syncThreshold,
+            options.outputType);
+        if (!ArgusSamples::execute(options))
+        {
+            return EXIT_FAILURE;
+        }
+    }
     return EXIT_SUCCESS;
 }
